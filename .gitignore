@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.pytest_cache/
+*.db
+locus_slim.parquet
+out/
+qid_map.json
+.env

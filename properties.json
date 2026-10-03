@@ -1,0 +1,48 @@
+{
+  "_comment": "Edit ids/datatypes to match lexipedia.wikibase.cloud. Run `python lexipedia_export.py check` from your machine to compare against the live instance. Datatypes marked assumed were not verified.",
+  "api": "https://lexipedia.wikibase.cloud/w/api.php",
+  "properties": {
+    "instance_of":       {"id": "P5",  "label": "instance of",         "datatype": "wikibase-item", "status": "existing"},
+    "part_of":           {"id": "P9",  "label": "part of",             "datatype": "wikibase-item", "status": "existing", "used": false},
+    "has_part":          {"id": "P10", "label": "has part",            "datatype": "wikibase-item", "status": "existing"},
+    "follows":           {"id": "P11", "label": "follows",             "datatype": "wikibase-item", "status": "existing", "used": false},
+    "followed_by":       {"id": "P12", "label": "followed by",         "datatype": "wikibase-item", "status": "existing"},
+    "references":        {"id": "P13", "label": "references",          "datatype": "wikibase-item", "status": "existing", "used": false},
+    "based_on":          {"id": "P14", "label": "based on",            "datatype": "wikibase-item", "status": "existing"},
+    "jurisdiction":      {"id": "P15", "label": "applies to jurisdiction", "datatype": "wikibase-item", "status": "existing", "datatype_assumed": true},
+    "deontic_modality":  {"id": "P16", "label": "deontic modality",    "datatype": "wikibase-item", "status": "existing", "datatype_assumed": true},
+    "bearer":            {"id": "P17", "label": "bearer",              "datatype": "wikibase-item", "status": "existing", "datatype_assumed": true},
+    "condition":         {"id": "P18", "label": "condition",           "datatype": "string",        "status": "existing", "datatype_assumed": true},
+    "sanction":          {"id": "P20", "label": "sanction",            "datatype": "string",        "status": "existing", "datatype_assumed": true},
+    "citation":          {"id": "P22", "label": "citation",            "datatype": "string",        "status": "existing", "datatype_assumed": true},
+    "legal_identifier":  {"id": "P25", "label": "legal identifier",    "datatype": "string",        "status": "existing", "datatype_assumed": true},
+
+    "regulated_subject": {"id": null, "label": "regulated subject",   "datatype": "wikibase-item", "status": "proposed", "essential": true,
+                          "why": "What a provision/process is about (e.g. dog license). The join key for 'compare dog licensing across places'."},
+    "fee_amount":        {"id": null, "label": "fee amount",          "datatype": "quantity",      "status": "proposed", "essential": true,
+                          "why": "Typed fee in USD so fees can be sorted and compared."},
+    "time_limit":        {"id": null, "label": "time limit",          "datatype": "quantity",      "status": "proposed", "essential": true,
+                          "why": "Deadline expressed in days (unit: day)."},
+    "renewal_interval":  {"id": null, "label": "renewal interval",    "datatype": "string",        "status": "proposed", "essential": true,
+                          "why": "annual / biennial / one-time / none. Could be an item later."},
+    "max_penalty_amount":{"id": null, "label": "maximum penalty amount", "datatype": "quantity",   "status": "proposed",
+                          "why": "Typed ceiling of the fine; P20 sanction keeps the text as written."},
+    "source_chunk_id":   {"id": null, "label": "LOCUS chunk ID",      "datatype": "external-id",   "status": "proposed",
+                          "why": "Traceability back to the LocalLaws/LOCUS-v1 row; also lets re-runs find existing items."},
+    "extraction_record": {"id": null, "label": "extraction record",   "datatype": "string",        "status": "proposed",
+                          "why": "Model + prompt version + reviewer note, so every LLM-assisted item says how it was made."}
+  },
+  "externals": {
+    "class:provision":  "ordinance provision",
+    "class:norm":       "legal norm (process step)",
+    "class:process":    "legal process model",
+    "class:subject":    "regulated subject",
+    "class:legal-role": "legal role",
+    "unit:usd":         "United States dollar",
+    "unit:day":         "day",
+    "modality:obligation":  "obligation",
+    "modality:prohibition": "prohibition",
+    "modality:permission":  "permission",
+    "modality:power":       "power"
+  }
+}
