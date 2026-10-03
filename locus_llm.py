@@ -7,6 +7,7 @@ inspected and sent back for debugging.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -79,26 +80,47 @@ def pull_model(host: str, model: str):
         raise LLMUnavailable(f"Cannot reach Ollama at {host}: {e.reason}") from e
 
 
+_THINKERS = re.compile(r"(qwen3|gpt-oss|deepseek-r1|gemma4|magistral|qwq|nemotron|phi4-reasoning|reason)", re.I)
+
+
+def pick_ctx(system: str, user: str, out_tokens: int = 900) -> int:
+    """Smallest context window that holds prompt + answer. Small windows are faster and fit more of the model in VRAM;
+    Ollama silently truncates the START of an over-long prompt (it would drop the instructions), so never undersize."""
+    need = (len(system) + len(user)) / 2.6 + out_tokens
+    for c in (4096, 8192, 16384, 32768):
+        if need < c * 0.9:
+            return c
+    return 32768
+
+
 def call_llm(model: str, host: str, system: str, user: str, schema: dict, *, stage: str = "", ctx: str = "",
-             timeout: int = 600) -> dict:
+             timeout: int = 1800) -> dict:
     """Ollama /api/chat with a JSON-schema `format`. temperature 0 + fixed seed for repeatability."""
     body = {
         "model": model, "stream": False, "format": schema,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "options": {"temperature": 0, "seed": 7, "num_ctx": 8192},
+        "options": {"temperature": 0, "seed": 7, "num_ctx": pick_ctx(system, user)},
     }
-    req = urllib.request.Request(host_url(host) + "/api/chat", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    if _THINKERS.search(model):          # reasoning models burn minutes 'thinking' before the JSON; turn it off (gpt-oss only goes as low as "low")
+        body["think"] = "low" if "gpt-oss" in model.lower() else False
     t0, raw, err, last = time.time(), "", "", None
     try:
         for _ in range(2):
+            req = urllib.request.Request(host_url(host) + "/api/chat", data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=timeout) as r:
                     data = json.load(r)
                 raw = data["message"]["content"]
                 return json.loads(raw)
+            except TimeoutError as e:
+                raise TimeoutError(f"{model} did not answer within {timeout}s ({stage or 'call'}). Raise the per-call timeout "
+                                   "in the Models panel, or use a smaller/faster model.") from e
             except urllib.error.HTTPError as e:
                 msg = e.read().decode("utf-8", "replace")[:300]
+                if e.code == 400 and "think" in msg.lower() and "think" in body:
+                    body.pop("think")       # this model does not take the option: retry without it
+                    continue
                 if e.code == 404:
                     raise LLMUnavailable(f"Model '{model}' is not available on {host} (HTTP 404). Pull it from the sidebar. {msg}") from e
                 raise LLMUnavailable(f"Ollama error {e.code}: {msg}") from e

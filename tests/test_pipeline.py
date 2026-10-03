@@ -24,12 +24,12 @@ def local(env, place="charlottesville"):
     return S.load_locus_place(duckdb.connect().cursor(), str(env["pq"]), "va", place)
 
 
-def candidates(env, query, place="charlottesville", state_law=True):
+def candidates(env, query, place="charlottesville", state_law=True, strict=False):
     cur = duckdb.connect().cursor()
     frames = {"local": local(env, place)}
     if state_law:
         frames["state"], _ = S.load_law_context(cur, env["template"], "va", ["statutes"], query.split(), 6, [])
-    return C.build_candidates(frames, query, {"local": 15, "state": 6, "federal": 0}, ["Rules", "Process", "Enforcement", "Context"])
+    return C.build_candidates(frames, query, {"local": 15, "state": 6, "federal": 0}, ["Rules", "Process", "Enforcement", "Context"], strict=strict)
 
 
 def job(env, m, query, model="qwen2.5:7b", place="charlottesville", verifier="", workers=1):
@@ -78,7 +78,8 @@ def test_model_server_status_pull_and_missing(env):
 
 # ───────────────────────── the whole pipeline ─────────────────────────
 def test_business_pipeline_end_to_end(env):
-    m = candidates(env, "business licen")
+    assert not any("inoperable" in h for h in candidates(env, "business licen", strict=True)["header"])   # strict match drops it before any model call
+    m = candidates(env, "business licen")          # loose match: the model must set it aside itself
     assert set(m["level"]) == {"local", "state"}
     j = job(env, m, "business licen")
     prog = M.Progress()
@@ -271,14 +272,14 @@ def test_app_places_models_and_pull(env):
     at.number_input(key="cmp_n").set_value(2).run()
 
     # Model B that is not installed -> pull from the UI
-    at.text_input(key="model_b").set_value("llama3:8b").run()
+    at.text_area(key="models_text").set_value("qwen2.5:7b\nllama3:8b").run()
     assert any("not installed" in md.value for md in at.markdown)
     at.button(key="pull1").click().run()
     assert not at.exception
     assert server_status(env["host"])["up"] and model_available(server_status(env["host"]), "llama3:8b")
 
     # two models, run everything in parallel from the Compare tab
-    at.text_input(key="model_b").set_value("qwen2.5:14b").run()
+    at.text_area(key="models_text").set_value("qwen2.5:7b\nqwen2.5:14b").run()
     at.text_input(key="cmp_q").set_value("dog licen").run()
     at.button(key="cmp_all").click().run()
     assert not at.exception, [e.value for e in at.exception]
@@ -295,3 +296,98 @@ def test_app_server_down_is_explained(env):
     at.text_input[[t.label for t in at.text_input].index("Ollama host")].set_value("http://127.0.0.1:1").run()
     assert any("not reachable" in e.value for e in at.error)
     assert any(b.label == "Start Ollama here" for b in at.button)
+
+
+# ───────────────────────── fixes from the first real run ─────────────────────────
+def test_debug_bundle_includes_query_regime_compile_calls(env):
+    m = candidates(env, "business licen", state_law=False)
+    j = job(env, m, "business licen", verifier="qwen2.5:14b")
+    M.run_pipeline(j, M.Progress())
+    pkey = M.pipeline_status(j)["pkey"]
+    stages = {r["stage"] for r in C.export_debug(pkey)["llm_log"]}
+    assert {"triage", "query", "relevance", "regime", "compile", "verify"} <= {s.split(":")[0] for s in stages}
+
+
+def test_junk_goal_falls_back_and_user_goal_skips_the_model(env):
+    m = candidates(env, "dog licen", state_law=False)
+    fake_ollama.STATE["junk_goal"] = True
+    j = job(env, m, "dog licen")
+    log = M.run_pipeline(j, M.Progress(), ["query"])
+    assert any("unusable" in e for e in log["errors"])
+    qi = C.query_get(j.query_key, j.model)
+    assert qi["by"] == "fallback" and M.goal_ok(qi["goal"]) and "dog licen" in qi["goal"]
+
+    fake_ollama.reset()
+    j2 = job(env, m, "dog licen")
+    j2.goal = "Get and keep a license for your dog in Charlottesville"
+    assert j2.query_key != j.query_key                                   # relevance cache is keyed by the goal
+    M.run_pipeline(j2, M.Progress(), ["query"])
+    assert C.query_get(j2.query_key, j2.model)["by"] == "user"
+    assert not [c for c in fake_ollama.STATE["calls"] if c[1] == "query"]
+
+
+def test_a_decision_table_belongs_to_one_task_only():
+    g = {"title": "t", "nodes": [
+        {"id": "a", "type": "task", "actor": "x", "label": "Calculate fee", "sources": ["c1.1"], "decision": "D1"},
+        {"id": "b", "type": "gateway", "actor": "x", "label": "Ok?", "sources": [], "decision": "D1"},
+        {"id": "c", "type": "task", "actor": "x", "label": "Pay", "sources": ["c1.2"], "decision": "D1"},
+        {"id": "d", "type": "end", "actor": "", "label": "Done", "sources": [], "decision": "D1"}], "edges": []}
+    nodes, *_ = M.normalize_graph(g, {"c1"}, {"c1.1", "c1.2"}, {"D1"})
+    assert [n["id"] for n in nodes.values() if n["decision"]] == ["a"]
+
+
+def test_strict_local_matching_drops_incidental_mentions(env):
+    import pandas as pd
+    loc = local(env)
+    extra = loc.iloc[[0]].copy()
+    extra["header"], extra["content"], extra["fn"] = "### 2-153 Fixing payday", "The manager sets the business payday. A license is separate.", "Rules"
+    frames = {"local": pd.concat([loc, extra], ignore_index=True)}
+    caps = {"local": 15, "state": 0, "federal": 0}
+    fns = ["Rules", "Process", "Enforcement", "Context"]
+    loose = C.build_candidates(frames, "business licen", caps, fns, strict=False)
+    strict = C.build_candidates(frames, "business licen", caps, fns, strict=True)
+    assert any("payday" in h for h in loose["header"]) and not any("payday" in h for h in strict["header"])
+    assert any("14-3" in h for h in strict["header"])
+
+
+def test_context_window_and_think_option(env):
+    from locus_llm import pick_ctx
+    assert pick_ctx("s" * 500, "u" * 3000) == 4096
+    assert pick_ctx("s" * 500, "u" * 12000) == 8192
+    assert pick_ctx("s" * 500, "u" * 60000) >= 32768 // 2                 # never undersized: Ollama would cut the instructions off
+    fake_ollama.STATE["bodies"].clear()
+    sch = {"type": "object", "properties": {"fee": {"type": "string"}, "days": {"type": "string"}}, "required": ["fee", "days"]}
+    call_llm("qwen3:14b", env["host"], "s", "u", sch, stage="t")
+    call_llm("qwen2.5:7b", env["host"], "s", "u", sch, stage="t")
+    call_llm("reason-weird", env["host"], "s", "u", sch, stage="t")    # rejects `think` -> retried without it
+    by = {}
+    for b in fake_ollama.STATE["bodies"]:
+        by.setdefault(b["model"], []).append(b["think"])
+    assert by["qwen3:14b"] == [False] and by["qwen2.5:7b"] == ["absent"] and by["reason-weird"] == [False, "absent"]
+
+
+def test_timeout_message_and_estimate(env, monkeypatch):
+    import socket
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(socket.timeout("timed out")))
+    with pytest.raises(TimeoutError, match="did not answer within 5s"):
+        call_llm("qwen2.5:7b", env["host"], "s", "u", {"type": "object"}, stage="extract:rules", timeout=5)
+    monkeypatch.undo()
+    m = candidates(env, "dog licen", state_law=False)
+    j = job(env, m, "dog licen")
+    e0 = M.estimate(j)
+    assert e0["basis"] == "default guesses" and e0["minutes"] > 0
+    M.run_pipeline(j, M.Progress())
+    e1 = M.estimate(j)
+    assert e1["calls"] == 0 and e1["minutes"] == 0
+
+
+def test_three_models_pairwise_agreement(env):
+    m = candidates(env, "dog licen", state_law=False)
+    recs = {}
+    for mod in ("qwen2.5:7b", "qwen2.5:14b", "tiny"):
+        j = job(env, m, "dog licen", mod)
+        M.run_pipeline(j, M.Progress())
+        recs[mod] = C.get_process(M.process_key(j))
+    rows = M.agreement_matrix(recs)
+    assert len(rows) == 3 and all("vs" in r["models"] for r in rows)

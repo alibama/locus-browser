@@ -31,7 +31,8 @@ from locus_hf import (OUL_REPO, apply_to_duckdb, dataset_access, find_token, fin
                       mask, own_token_path, probe_duckdb, save_token, whoami)
 from locus_dmn import decision_xml
 from locus_llm import LLMUnavailable, model_available, model_selftest, pull_model, server_status, start_server
-from locus_markup import STAGES, Job, Progress, agreement, pipeline_status, process_key, run_jobs, run_pipeline
+from locus_markup import (STAGES, Job, Progress, agreement_matrix, estimate, goal_ok, pipeline_status, process_key, run_jobs,
+                          run_pipeline)
 from locus_sources import OUL_CORPORA, OUL_TEMPLATE, load_law_context, load_locus_place, locus_places, locus_states
 
 DEFAULT_SRC = os.environ.get("LOCUS_SRC", "hf://datasets/LocalLaws/LOCUS-v1/**/*.parquet")
@@ -163,11 +164,12 @@ def models_panel() -> dict:
         with st.expander("Installed models"):
             st.dataframe(pd.DataFrame([{"model": m["name"], "GB": round(m["size"] / 1e9, 1)} for m in status["models"]]))
 
-    model_a = st.text_input("Model A", default_model(), key="model_a").strip()
-    model_b = st.text_input("Model B (optional — runs at the same time as A)", "", key="model_b").strip()
+    models_text = st.text_area("Models to compare (one per line, up to 4)", default_model(), key="models_text", height=90,
+                               help="Each model gets its own stored results; nothing is overwritten. The first line is the default.")
+    models = list(dict.fromkeys(m.strip() for m in models_text.splitlines() if m.strip()))[:4]
     verifier = st.text_input("Verifier (optional)", "", key="verifier",
                              help="Checks every cited rule against its source. A different model than the extractor catches more.").strip()
-    wanted = [m for m in dict.fromkeys([model_a, model_b, verifier]) if m]
+    wanted = [m for m in dict.fromkeys([*models, verifier]) if m]
     for i, m in enumerate(wanted):
         have = model_available(status, m) if status["up"] else None
         c1, c2 = st.columns([3, 2])
@@ -186,12 +188,16 @@ def models_panel() -> dict:
         elif status["up"] and have and c2.button("Self-test", key=f"test{i}", help="Tiny schema-following check"):
             r = model_selftest(host, m)
             (st.success if r["ok"] else st.error)(f"{m}: {'OK' if r['ok'] else r['error']} ({r['seconds']}s)")
-    models = [m for m in dict.fromkeys([model_a, model_b]) if m]
-    parallel = st.checkbox("Run models at the same time", True,
-                           help="One worker thread per model. Both models must fit in memory or Ollama will swap them (OLLAMA_MAX_LOADED_MODELS).")
+    parallel = st.checkbox("Run models at the same time", len(models) <= 2, key="parallel",
+                           help="One worker thread per model. This only saves time if every model fits in memory together AND "
+                                "the hardware has spare capacity; on one GPU it usually just makes each model slower. Check "
+                                "`ollama ps` for the CPU/GPU split.")
     workers = int(st.number_input("Requests in flight per model", 1, 4, 1,
                                   help="Raise only if Ollama is started with OLLAMA_NUM_PARALLEL > 1."))
-    return {"host": host, "models": models, "verifier": verifier, "parallel": parallel, "workers": workers, "status": status}
+    timeout = int(st.number_input("Per-call timeout (seconds)", 120, 7200, 1800, step=120,
+                                  help="A slow machine can need many minutes for one call on a larger model."))
+    return {"host": host, "models": models, "verifier": verifier, "parallel": parallel, "workers": workers, "timeout": timeout,
+            "status": status}
 
 
 # ───────────────────────────── running jobs with live progress ─────────────────────────────
@@ -235,21 +241,22 @@ def gather(src, state, place, query, cfg) -> tuple[pd.DataFrame, list[str]]:
     frames = {"local": local}
     problems: list[str] = []
     terms = tuple(t for t in query.lower().split() if t)
+    sterms = tuple(t for t in (cfg.get("state_query") or query).lower().split() if t)
     pinned = tuple(p.strip() for p in cfg["pinned"].split(",") if p.strip())
-    if cfg["state_law"] and terms:
-        frames["state"], pr = load_law(cfg["template"], state, tuple(cfg["corpora"]), terms, cfg["cap_state"], pinned)
+    if cfg["state_law"] and (sterms or pinned):
+        frames["state"], pr = load_law(cfg["template"], state, tuple(cfg["corpora"]), sterms, cfg["cap_state"], pinned)
         problems += pr
     if cfg["federal_law"] and terms:
         frames["federal"], pr = load_law(cfg["template"], cfg["fed_code"], tuple(cfg["corpora"]), terms, cfg["cap_fed"], ())
         problems += pr
     caps = {"local": cfg["cap_local"], "state": cfg["cap_state"], "federal": cfg["cap_fed"]}
     fns = ["Rules", "Process", "Enforcement"] + (["Context"] if cfg["ctx"] else [])
-    return C.build_candidates(frames, query, caps, fns), problems
+    return C.build_candidates(frames, query, caps, fns, strict=cfg.get("strict", True)), problems
 
 
-def make_job(m, state, place, query, model, mcfg) -> Job:
+def make_job(m, state, place, query, model, mcfg, goal: str = "") -> Job:
     return Job(state=state, place=place, query=query, chunks=m, model=model, host=mcfg["host"],
-               verifier=mcfg["verifier"], workers=mcfg["workers"])
+               verifier=mcfg["verifier"], workers=mcfg["workers"], goal=goal, timeout=mcfg["timeout"])
 
 
 def stage_line(stt: dict) -> str:
@@ -274,6 +281,13 @@ def section_table(job: Job, stt: dict) -> pd.DataFrame:
 def cell(job: Job, kp: str, color_dim: str | None, height: int = 520) -> None:
     stt = pipeline_status(job)
     st.caption(stage_line(stt))
+    qi = C.query_get(job.query_key, job.model)
+    if qi:
+        (st.caption if qi.get("by") != "fallback" else st.warning)(
+            f"Goal used ({qi.get('by', 'llm')}): {qi['goal']}" + ("  — the model's guess was unusable; type a goal above." if qi.get("by") == "fallback" else ""))
+    if not stt["process"]:
+        eta = estimate(job)
+        st.caption(f"Estimated time left: about {eta['minutes']} min for ~{eta['calls']} model calls (based on {eta['basis']}).")
     c1, c2, c3 = st.columns([2, 2, 2])
     if c1.button("Run pipeline (resumes)", key=kp + "run"):
         run_with_progress([job], False)
@@ -459,14 +473,18 @@ def sources_panel() -> dict:
         template = st.text_input("File template", TEMPLATE)
         corpora = st.multiselect("Corpora", OUL_CORPORA, default=["statutes"])
         fed_code = st.text_input("Federal jurisdiction code in file names", "us", help="Check the dataset's Files tab: us, federal, …")
-        pinned = st.text_input("Always include citations containing", "", help="Comma-separated, e.g. 58.1-3703")
+        state_query = st.text_input("State-law search words (blank = same as topic)", "",
+                                    help="State statutes use different words than local codes, e.g. 'local license tax gross receipts'.")
+        pinned = st.text_input("Always include citations containing", "", help="Comma-separated, e.g. 58.1-37 for Virginia's local-tax chapter")
     hf_panel(template)
     c1, c2, c3 = st.columns(3)
+    strict = st.checkbox("Local sections must contain the topic phrase (or have it in the title)", True,
+                         help="Stops sections that merely mention both words somewhere (e.g. 'Fixing payday') from being sent to the model.")
     cap_local = int(c1.number_input("Local max", 1, 60, 15))
     cap_state = int(c2.number_input("State max", 0, 30, 6))
     cap_fed = int(c3.number_input("Fed max", 0, 20, 0))
     return {"src": src, "agg_src": agg_src, "sub_only": sub_only, "state_law": state_law, "federal_law": federal_law,
-            "template": template, "corpora": corpora or ["statutes"], "fed_code": fed_code, "pinned": pinned,
+            "template": template, "corpora": corpora or ["statutes"], "fed_code": fed_code, "pinned": pinned, "state_query": state_query, "strict": strict,
             "cap_local": cap_local, "cap_state": cap_state, "cap_fed": cap_fed, "ctx": False}
 
 
@@ -581,14 +599,18 @@ def main() -> None:
         c1, c2 = st.columns([4, 1])
         pq = c1.text_input("Topic (all words must appear; stems work)", "business licen", key="pb_q")
         cfg["ctx"] = c2.checkbox("Include Context", False, key="pb_ctx")
+        pgoal = st.text_input("What process are you mapping? (one sentence — optional; the model guesses if blank)", "", key="pb_goal",
+                              placeholder="e.g. Start a new business in Charlottesville: what must the owner do, pay and file?")
+        if pgoal.strip() and not goal_ok(pgoal):
+            st.caption("A full sentence works best (at least 4 words).")
         m, problems = gather(src, state, place, pq, cfg)
         for p in problems:
             st.warning("open-us-law: " + law_hint(p))
         if m.empty:
-            st.info("No matching sections. Try fewer or shorter words.")
+            st.info("No matching sections. Try fewer or shorter words, or untick the topic-phrase filter.")
         else:
             st.caption(f"{len(m)} candidate sections: " + " / ".join(f"{int((m['level'] == lv).sum())} {lv}" for lv in ("local", "state", "federal")))
-            jobs = [make_job(m, state, place, pq, mod, mcfg) for mod in models]
+            jobs = [make_job(m, state, place, pq, mod, mcfg, pgoal) for mod in models]
             if len(jobs) > 1 and st.button("Run all models now", key="pb_all"):
                 run_with_progress(jobs, mcfg["parallel"])
                 st.rerun()
@@ -596,11 +618,11 @@ def main() -> None:
                 with col:
                     st.markdown(f"#### {job.model}")
                     cell(job, f"pb{i}_", color_dim)
-            if len(jobs) == 2:
-                ag = agreement(C.get_process(process_key(jobs[0])), C.get_process(process_key(jobs[1])))
-                if ag:
-                    st.subheader("Do the two models agree?")
-                    st.json(ag)
+            if len(jobs) > 1:
+                rows = agreement_matrix({j.model: C.get_process(process_key(j)) for j in jobs})
+                if rows:
+                    st.subheader("Do the models agree?")
+                    st.dataframe(pd.DataFrame(rows).astype(str))
 
     # ── Compare: places × models ──
     with t_cmp:
@@ -611,6 +633,7 @@ def main() -> None:
         cfg["ctx"] = c2.checkbox("Include Context", False, key="cmp_ctx")
         n = int(c3.number_input("Places to compare", 2, 8, 2, key="cmp_n"))
         per_row = int(c4.number_input("Columns per row", 1, 4, 3, key="cmp_cols"))
+        cgoal = st.text_input("What process are you comparing? (optional sentence)", "", key="cmp_goal")
         picks: list[tuple[str, str]] = []
         for i, col in enumerate(grid_cols(n, per_row)):
             with col:
@@ -627,7 +650,7 @@ def main() -> None:
             cand.append((s, p, mm))
             for x in pr:
                 st.warning(f"{p}: open-us-law: " + law_hint(x))
-        all_jobs = [make_job(mm, s, p, cq, mod, mcfg) for s, p, mm in cand if len(mm) for mod in models]
+        all_jobs = [make_job(mm, s, p, cq, mod, mcfg, cgoal) for s, p, mm in cand if len(mm) for mod in models]
         if all_jobs and st.button(f"Run everything ({len(cand)} places × {len(models)} model(s))", key="cmp_all"):
             run_with_progress(all_jobs, mcfg["parallel"])
             st.rerun()
@@ -640,15 +663,14 @@ def main() -> None:
         st.subheader("At a glance")
         st.dataframe(pd.DataFrame(cols_tbl).astype(str))
 
-        if len(models) == 2:
+        if len(models) > 1:
             rows = []
-            for s, p, mm in cand:
+            for s_, p_, mm in cand:
                 if len(mm):
-                    ag = agreement(*(C.get_process(process_key(make_job(mm, s, p, cq, mod, mcfg))) for mod in models))
-                    if ag:
-                        rows.append({"place": f"{p.title()}, {s.upper()}", **{k: str(v) for k, v in ag.items()}})
+                    for r_ in agreement_matrix({mod: C.get_process(process_key(make_job(mm, s_, p_, cq, mod, mcfg, cgoal))) for mod in models}):
+                        rows.append({"place": f"{p_.title()}, {s_.upper()}", **{k: str(v) for k, v in r_.items()}})
             if rows:
-                st.subheader("Do the two models agree?")
+                st.subheader("Do the models agree?")
                 st.dataframe(pd.DataFrame(rows))
 
         st.subheader("Process models")
@@ -660,7 +682,7 @@ def main() -> None:
             for col, (mi, mod) in zip(grid_cols(len(models), 2), enumerate(models)):
                 with col:
                     st.markdown(f"**{mod}**")
-                    cell(make_job(mm, s, p, cq, mod, mcfg), f"cmp{pi}_{mi}_", color_dim, height=460)
+                    cell(make_job(mm, s, p, cq, mod, mcfg, cgoal), f"cmp{pi}_{mi}_", color_dim, height=460)
 
     # ── Library ──
     with t_lib:

@@ -127,8 +127,9 @@ RELEVANCE_SYSTEM = (
     "Decide whether a section belongs in a step-by-step process map for the GOAL below, from the point of view of the "
     "AUDIENCE. yes = directly part of what they must do, pay, file or face. partial = applies only to a sub-group, or "
     "is needed context (definition, threshold, authority). no = a different subject, a different class of business or "
-    "activity than the goal, or only about what officials do internally. Give a one-sentence reason and the phase this "
-    "section belongs to: " + ", ".join(PHASES) + " (out_of_scope if verdict is no).")
+    "activity than the goal, or only about what officials do internally. If a section belongs to the same legal scheme as the "
+    "topic (same chapter, same tax or license) and you are unsure between partial and no, choose partial. Give a one-sentence "
+    "reason and the phase this section belongs to: " + ", ".join(PHASES) + " (out_of_scope if verdict is no).")
 RULES_SYSTEM = (
     "Extract the rules stated in ONE section of US law. Use only the text; if something is not stated return an empty "
     "string and never guess. One entry per distinct rule (max 6). rule_type: duty, prohibition, permission, "
@@ -263,6 +264,7 @@ def claim_of(rule: dict) -> dict:
 def normalize_graph(g: dict, chunk_codes: set[str], rule_codes: set[str] | None = None, decision_ids: set[str] | None = None):
     """Sanitise an LLM graph. 'sources' are split into rule codes (c3.1) and chunk codes (c3)."""
     rule_codes, decision_ids = rule_codes or set(), decision_ids or set()
+    used_decisions: set[str] = set()
     nodes: dict[str, dict] = {}
     order: list[str] = []
     for n in g.get("nodes", []) or []:
@@ -279,9 +281,13 @@ def normalize_graph(g: dict, chunk_codes: set[str], rule_codes: set[str] | None 
             if base in chunk_codes and base not in srcs:
                 srcs.append(base)
         dec = clean(n.get("decision")).strip()
+        # a decision table hangs off ONE task: gateways/outcomes can't own one, and only the first claimant keeps it
+        # (a model that stamps 'D1' on every node is not saying anything)
+        dec = dec if (dec in decision_ids and t == "task" and dec not in used_decisions) else ""
+        if dec:
+            used_decisions.add(dec)
         nodes[nid] = {"id": nid, "type": t, "actor": clean(n.get("actor")).strip(),
-                      "label": clean(n.get("label")).strip() or nid, "sources": srcs, "rules": rules,
-                      "decision": dec if dec in decision_ids else ""}
+                      "label": clean(n.get("label")).strip() or nid, "sources": srcs, "rules": rules, "decision": dec}
         order.append(nid)
     edges, seen, dropped = [], set(), 0
     for e in g.get("edges", []) or []:
@@ -346,6 +352,8 @@ class Job:
     verifier: str = ""
     audience: str = "regulated_person"
     workers: int = 1
+    goal: str = ""             # optional human-written goal; skips the model's guess
+    timeout: int = 1800        # seconds per model call
     abort: threading.Event = field(default_factory=threading.Event)
 
     @property
@@ -354,7 +362,7 @@ class Job:
 
     @property
     def query_key(self) -> str:
-        return hashlib.sha1(self.query.strip().lower().encode()).hexdigest()[:12]
+        return hashlib.sha1((self.query.strip().lower() + "|" + self.goal.strip().lower()).encode()).hexdigest()[:12]
 
     @property
     def ver(self) -> str:
@@ -429,6 +437,30 @@ def pipeline_status(job: Job) -> dict:
             "relevance_data": rel, "extract_data": ex}
 
 
+DEFAULT_SECONDS = {"triage": 60, "relevance": 40, "extract:rules": 120, "extract:rates": 120, "query": 30, "regime": 90,
+                   "compile": 120, "verify": 40}
+
+
+def estimate(job: Job) -> dict:
+    """Rough time left, from this machine's own earlier call timings for this model (defaults otherwise)."""
+    st = pipeline_status(job)
+    stats = C.llm_stats(job.model)
+    vstats = C.llm_stats(job.ver) if job.ver != job.model else stats
+    sec = lambda stage, s=stats: s.get(stage, (DEFAULT_SECONDS[stage], 0))[0]
+    n = st["chunks"]
+    relevant = st["relevant"] if st["relevance"] >= n else max(1, round(0.4 * n))
+    calls = {"triage": max(0, n - st["triage"]), "relevance": max(0, n - st["relevance"]),
+             "extract": max(0, relevant - st["extract"]), "query": 0 if st["query"] else 1,
+             "regime": 0 if st["regime"] else 1, "compile": 0 if st["process"] else 1,
+             "verify": 0 if st["verified"] else min(10, max(3, relevant))}
+    ex = (sec("extract:rules") + sec("extract:rates")) / 2
+    secs = (calls["triage"] * sec("triage") + calls["relevance"] * sec("relevance") + calls["extract"] * ex
+            + calls["query"] * sec("query") + calls["regime"] * sec("regime") + calls["compile"] * sec("compile")
+            + calls["verify"] * sec("verify", vstats))
+    seen = sum(n_ for _, n_ in stats.values())
+    return {"minutes": round(secs / 60), "calls": sum(calls.values()), "basis": f"{seen} earlier calls" if seen else "default guesses"}
+
+
 def regime_key(job: Job) -> str:
     return hashlib.sha1("|".join([job.state, job.place, job.query.strip().lower(), job.model, C.SCHEMA_VER,
                                   *sorted(job.chunks["ckey"])]).encode()).hexdigest()[:20]
@@ -452,7 +484,7 @@ def stage_triage(job: Job, prog: Progress) -> list[str]:
                 "self_contained": False, "refs": [], "quality": q, "skipped_llm": True})
             return
         d = call_llm(job.model, job.host, sysmsg, f"{_hdr(job, r)}\n\nText:\n{_chunk_text(r)}", TRIAGE_SCHEMA,
-                     stage="triage", ctx=r["ckey"])
+                     stage="triage", ctx=r["ckey"], timeout=job.timeout)
         t = norm_triage(d, q)
         for s in t["subjects"]:
             if s.startswith("new:"):
@@ -463,19 +495,38 @@ def stage_triage(job: Job, prog: Progress) -> list[str]:
     return _map(job, prog, "triage", todo, one)
 
 
+def goal_ok(g: str) -> bool:
+    """A usable goal is a real sentence ('Obtain a business license'), not a stray word like 'search'."""
+    return len(g.split()) >= 4 and len(g) >= 20
+
+
+def default_goal(query: str) -> str:
+    return f"Find out what a person must do, pay, file or face under the local rules about {query.strip()}"
+
+
 def stage_query(job: Job, prog: Progress) -> list[str]:
     if C.query_get(job.query_key, job.model):
         return []
     prog.set(job.pid, stage="query", done=0, total=1)
+    if job.goal.strip():           # a human-written goal beats a guess: no model call
+        C.query_put(job.query_key, job.model, {"goal": _s(job.goal, 300), "audience": job.audience, "subjects": [],
+                                               "keywords": [], "by": "user"})
+        prog.set(job.pid, done=1)
+        return []
     d = call_llm(job.model, job.host, QUERY_SYSTEM.format(subjects=_subject_list()), f"Topic typed: {job.query}\n"
-                 f"Jurisdiction: {job.place}, {job.state.upper()}", QUERY_SCHEMA, stage="query", ctx=job.query_key)
+                 f"Jurisdiction: {job.place}, {job.state.upper()}", QUERY_SCHEMA, stage="query", ctx=job.query_key,
+                 timeout=job.timeout)
     subs = [C.slug(s[4:]) if s.startswith("new:") else C.slug(s) for s in (d.get("subjects") or [])][:4]
+    g, errs = _s(d.get("goal"), 200), []
+    by = "llm"
+    if not goal_ok(g):
+        errs.append(f"query: the model's goal ({g!r}) was unusable, so a default goal is used. Type your own goal above to override it.")
+        g, by = default_goal(job.query), "fallback"
     C.query_put(job.query_key, job.model, {
-        "goal": _s(d.get("goal"), 200) or f"Understand the rules about {job.query}",
-        "audience": _e(d.get("audience"), AUDIENCES, job.audience), "subjects": subs,
-        "keywords": [_s(k, 30) for k in (d.get("keywords") or [])][:6]})
+        "goal": g, "audience": _e(d.get("audience"), AUDIENCES, job.audience), "subjects": subs,
+        "keywords": [_s(k, 30) for k in (d.get("keywords") or [])][:6], "by": by})
     prog.set(job.pid, done=1)
-    return []
+    return errs
 
 
 def stage_relevance(job: Job, prog: Progress) -> list[str]:
@@ -491,9 +542,9 @@ def stage_relevance(job: Job, prog: Progress) -> list[str]:
             C.relevance_put(r["ckey"], job.query_key, job.model,
                             {"verdict": "no", "reason": "heading or page artifact (not enough text)", "phase": "out_of_scope", "by": "rule"})
             return
-        user = (f"GOAL: {qi['goal']}\nAUDIENCE: {qi['audience']}\n\n{_hdr(job, r)}\nTriage: role={t['role']}, "
+        user = (f"GOAL: {qi['goal']}\nTOPIC the researcher typed: {job.query}\nAUDIENCE: {qi['audience']}\n\n{_hdr(job, r)}\nTriage: role={t['role']}, "
                 f"audience={t['audience']}, regime={t['regime']}\nSummary: {t['summary']}\n\nText:\n{clean(r['content'])[:2500]}")
-        d = call_llm(job.model, job.host, RELEVANCE_SYSTEM, user, RELEVANCE_SCHEMA, stage="relevance", ctx=r["ckey"])
+        d = call_llm(job.model, job.host, RELEVANCE_SYSTEM, user, RELEVANCE_SCHEMA, stage="relevance", ctx=r["ckey"], timeout=job.timeout)
         C.relevance_put(r["ckey"], job.query_key, job.model,
                         {"verdict": _e(d.get("verdict"), RELEVANCE, "partial"), "reason": _s(d.get("reason"), 240),
                          "phase": _e(d.get("phase"), PHASES, ROLE_TO_PHASE.get(t["role"], "scope")), "by": "llm"})
@@ -513,14 +564,14 @@ def stage_extract(job: Job, prog: Progress) -> list[str]:
         t, text = tri[r["ckey"]], clean(r["content"])
         body = f"{_hdr(job, r)}\nTriage role: {t['role']}\n\nText:\n{_chunk_text(r)}"
         if t["role"] == "rate_schedule":
-            d = call_llm(job.model, job.host, RATES_SYSTEM, body, RATES_SCHEMA, stage="extract:rates", ctx=r["ckey"])
+            d = call_llm(job.model, job.host, RATES_SYSTEM, body, RATES_SCHEMA, stage="extract:rates", ctx=r["ckey"], timeout=job.timeout)
             out = {"kind": "rates", "table_title": _s(d.get("table_title"), 160), "rows": norm_rows(d, text), "rules": []}
         elif t["role"] == "definition":
-            d = call_llm(job.model, job.host, DEFS_SYSTEM, body, DEFS_SCHEMA, stage="extract:defs", ctx=r["ckey"])
+            d = call_llm(job.model, job.host, DEFS_SYSTEM, body, DEFS_SCHEMA, stage="extract:defs", ctx=r["ckey"], timeout=job.timeout)
             out = {"kind": "defs", "terms": [{"term": _s(x.get("term"), 80), "meaning": _s(x.get("meaning"), 240)}
                                              for x in (d.get("terms") or []) if isinstance(x, dict)], "rules": []}
         else:
-            d = call_llm(job.model, job.host, RULES_SYSTEM, body, RULES_SCHEMA, stage="extract:rules", ctx=r["ckey"])
+            d = call_llm(job.model, job.host, RULES_SYSTEM, body, RULES_SCHEMA, stage="extract:rules", ctx=r["ckey"], timeout=job.timeout)
             out = {"kind": "rules", "rules": norm_rules(d, text)}
         C.markup_put(r["ckey"], "extract", job.model, out)
 
@@ -560,7 +611,7 @@ def stage_regime(job: Job, prog: Progress) -> list[str]:
     try:
         d = call_llm(job.model, job.host, REGIME_SYSTEM.format(subjects=_subject_list()),
                      f"GOAL: {qi['goal']}\nJurisdiction: {job.place}, {job.state.upper()}\n\nSections:\n" + "\n".join(lines),
-                     REGIME_SCHEMA, stage="regime", ctx=job.query_key)
+                     REGIME_SCHEMA, stage="regime", ctx=job.query_key, timeout=job.timeout)
     except LLMUnavailable:
         raise
     except Exception as e:  # noqa: BLE001  — keep going with a deterministic outline
@@ -641,7 +692,7 @@ def stage_compile(job: Job, prog: Progress, force: bool = False) -> list[str]:
             + ("\n\nDECISION TABLES available:\n" + "\n".join(decision_lines) if decision_lines else "")
             + ("\n\nMISSING from the sources (do not invent): " + "; ".join(m["item"] for m in regime.get("missing", [])) if regime.get("missing") else ""))
     prog.set(job.pid, stage="compile", done=0, total=1)
-    graph = call_llm(job.model, job.host, COMPILE_SYSTEM, user, COMPILE_SCHEMA, stage="compile", ctx=job.query_key)
+    graph = call_llm(job.model, job.host, COMPILE_SYSTEM, user, COMPILE_SCHEMA, stage="compile", ctx=job.query_key, timeout=job.timeout)
     chunk_recs = []
     for _, r in job.chunks.iterrows():
         chunk_recs.append({
@@ -679,7 +730,7 @@ def stage_verify(job: Job, prog: Progress, force: bool = False) -> list[str]:
         rule, chunk = rules_by[code], chunks[rules_by[code]["chunk"]]
         d = call_llm(job.ver, job.host, VERIFY_SYSTEM,
                      f"TEXT:\n{chunk['text'][:3000]}\n\nCLAIM:\n{json.dumps(claim_of(rule), ensure_ascii=False)}",
-                     VERIFY_SCHEMA, stage="verify", ctx=pkey)
+                     VERIFY_SCHEMA, stage="verify", ctx=pkey, timeout=job.timeout)
         v, issues, quote = _e(d.get("verdict"), VERDICTS, "partial"), [_s(i, 160) for i in d.get("issues") or []][:4], _s(d.get("quote"), 300)
         q_ok = quote_in(quote, chunk["text"])
         if v == "supported" and not q_ok:
@@ -742,6 +793,20 @@ def run_jobs(jobs: list[Job], prog: Progress, parallel: bool = True) -> dict[str
         for f in futs:
             f.result()
     return results
+
+
+def agreement_matrix(recs: dict[str, dict | None]) -> list[dict]:
+    """Pairwise agreement for any number of models: one row per pair."""
+    names = [m for m, r in recs.items() if r]
+    out = []
+    for i, x in enumerate(names):
+        for y in names[i + 1:]:
+            ag = agreement(recs[x], recs[y])
+            if ag:
+                out.append({"models": f"{x}  vs  {y}", "task labels shared": ag["task_label_overlap"],
+                            "typed facts shared": ag["typed_fact_overlap"], "tasks": f"{ag['tasks_a']} / {ag['tasks_b']}",
+                            "only in first": ", ".join(ag["facts_only_a"]), "only in second": ", ".join(ag["facts_only_b"])})
+    return out
 
 
 def agreement(a: dict | None, b: dict | None) -> dict:

@@ -10,13 +10,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
-STATE = {"installed": {"qwen2.5:7b", "qwen2.5:14b", "tiny"}, "calls": [], "inflight": {}, "max_models_inflight": 0,
-         "max_inflight": 0, "delay": 0.03}
+STATE = {"installed": {"qwen2.5:7b", "qwen2.5:14b", "tiny", "qwen3:14b", "reason-weird"}, "calls": [], "inflight": {},
+         "max_models_inflight": 0, "max_inflight": 0, "delay": 0.03, "bodies": [], "junk_goal": False}
 
 
 def reset():
     with LOCK:
-        STATE.update(installed={"qwen2.5:7b", "qwen2.5:14b", "tiny"}, calls=[], inflight={}, max_models_inflight=0, max_inflight=0)
+        STATE.update(installed={"qwen2.5:7b", "qwen2.5:14b", "tiny", "qwen3:14b", "reason-weird"}, calls=[], inflight={},
+                     max_models_inflight=0, max_inflight=0, bodies=[], junk_goal=False)
 
 
 def _quote(text: str, needle: str) -> str:
@@ -200,6 +201,9 @@ class H(BaseHTTPRequestHandler):
         model = body["model"]
         with LOCK:
             known = model in STATE["installed"]
+            STATE["bodies"].append({"model": model, "think": body.get("think", "absent"), "num_ctx": body["options"]["num_ctx"]})
+        if model == "reason-weird" and "think" in body:
+            return self._send({"error": "this model does not support think"}, 400)
         if not known:
             return self._send({"error": f"model '{model}' not found"}, 404)
         with LOCK:
@@ -215,7 +219,7 @@ class H(BaseHTTPRequestHandler):
                 stage, out = "triage", triage(sec, text)
             elif "goal" in props and "keywords" in props:
                 stage = "query"
-                out = dict(goal="Obtain and keep a dog license" if "dog" in user.lower() else "Obtain a business license",
+                out = dict(goal="search" if STATE["junk_goal"] else ("Obtain and keep a dog license" if "dog" in user.lower() else "Obtain a business license"),
                            audience="regulated_person", subjects=["dog-license"] if "dog" in user.lower() else ["business-license"], keywords=["license"])
             elif "verdict" in props and "phase" in props:
                 stage, out = "relevance", relevance(user.split("\n")[0], sec, text)

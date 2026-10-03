@@ -105,6 +105,9 @@ def search_oul(cur, path: str, jur: str, terms: list[str], cap: int, pinned: lis
     cond = " AND ".join(where) if where else "FALSE"
     score = " + ".join(f"(CASE WHEN {t_expr} LIKE ? THEN 3 ELSE 0 END)" for t in terms) or "0"
     score_params = [f"%{t.lower()}%" for t in terms]
+    if len(terms) > 1:      # the whole phrase in the title is a much stronger signal than the words scattered about
+        score += f" + (CASE WHEN {t_expr} LIKE ? THEN 8 ELSE 0 END)"
+        score_params.append("%" + " ".join(t.lower() for t in terms) + "%")
     pin_cond, pin_params = "FALSE", []
     if pinned:
         pin_cond = " OR ".join(f"lower(coalesce(CAST({cit} AS VARCHAR), '')) LIKE ?" for _ in pinned)

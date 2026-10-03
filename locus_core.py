@@ -311,6 +311,14 @@ def log_llm(stage: str, model: str, ctx: str, system: str, user: str, response: 
         pass  # logging must never break a run
 
 
+def llm_stats(model: str) -> dict[str, tuple[float, int]]:
+    """stage -> (mean seconds, number of calls) from earlier successful calls on this machine."""
+    with closing(_db()) as c:
+        rows = c.execute("SELECT stage, avg(seconds), count(*) FROM llm_log WHERE model=? AND (error IS NULL OR error='') "
+                         "GROUP BY stage", [model]).fetchall()
+    return {s: (a, n) for s, a, n in rows}
+
+
 def export_debug(pkey: str) -> dict:
     """Everything needed to understand (or reproduce) one process — what to send back when something looks wrong."""
     rec = get_process(pkey)
@@ -320,9 +328,11 @@ def export_debug(pkey: str) -> dict:
     model = rec.get("model", "")
     with closing(_db()) as c:
         qm = ",".join("?" * len(keys)) or "''"
+        # query / regime / compile calls are logged under the query key, the rest under chunk keys or the process key
         logs = c.execute(
-            f"SELECT ts, stage, model, ctx, system, user, response, seconds, error FROM llm_log WHERE ctx=? OR ctx IN ({qm}) ORDER BY id",
-            [pkey, *keys]).fetchall()
+            f"SELECT ts, stage, model, ctx, system, user, response, seconds, error FROM llm_log "
+            f"WHERE model IN (?, ?) AND (ctx=? OR ctx=? OR ctx IN ({qm})) ORDER BY id",
+            [model, rec.get("verifier") or model, pkey, rec.get("query_key", "-"), *keys]).fetchall()
     return {
         "process": rec, "schema_ver": SCHEMA_VER,
         "triage": markup_get(keys, "triage", model), "extract": markup_get(keys, "extract", model),
@@ -348,8 +358,11 @@ def score_frame(df: pd.DataFrame, query: str) -> pd.DataFrame:
     return out
 
 
-def build_candidates(frames: dict[str, pd.DataFrame], query: str, caps: dict[str, int], fns: list[str]) -> pd.DataFrame:
-    """frames: level -> unified frame (already filtered/ranked for state/federal). Adds ckey + code."""
+def build_candidates(frames: dict[str, pd.DataFrame], query: str, caps: dict[str, int], fns: list[str],
+                     strict: bool = True) -> pd.DataFrame:
+    """frames: level -> unified frame (already filtered/ranked for state/federal). Adds ckey + code.
+    strict: a local section must have a query word in its title, or contain the whole topic phrase in its text.
+    (Otherwise 'business licen' also pulls in 'Fixing payday', which merely mentions both words somewhere.)"""
     parts = []
     for level in ("local", "state", "federal"):
         df = frames.get(level)
@@ -358,6 +371,10 @@ def build_candidates(frames: dict[str, pd.DataFrame], query: str, caps: dict[str
         if level == "local":
             m = score_frame(df, query)
             m = m[m["fn"].isin(fns)]
+            if strict and _terms(query):
+                phrase = " ".join(_terms(query))
+                in_text = m["content"].fillna("").str.lower().str.replace(r"\s+", " ", regex=True).str.contains(re.escape(phrase))
+                m = m[(m["_score"] > 0) | in_text]
             m = m.sort_values("_score", ascending=False, kind="stable").head(caps[level]).sort_index().drop(columns="_score")
         else:
             m = df.head(caps[level]).copy()

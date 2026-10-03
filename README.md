@@ -67,6 +67,17 @@ the quote is checked). Rates are never flat fees; numbers must appear in the sou
 Every process has a **Debug bundle** download (all stage outputs plus every prompt and raw model response). That is the thing to
 send when a result looks wrong.
 
+
+## Choosing models
+
+Unverified starting points (check `ollama.com/library` for current tags; this moves fast): for schema-constrained extraction, larger is
+more reliable than smaller. Good first comparisons are a bigger sibling of the baseline (a 14B Qwen), a different family
+(a Gemma 12B-class model), and a Mistral-family model (`mistral-nemo:12b`, or `mistral-small3.2:24b` if it fits). Mixture-of-experts models
+(`gpt-oss:20b`, the Qwen3.x "-A3B" variants, Gemma "26B-A4B") only compute ~3-4B parameters per token, so they are often *faster* than a
+dense 14B if they fit in memory. Use a **different model as the verifier** than the extractor. Reasoning ("thinking") models are told
+not to think (`think: false`), because the extra minutes buy nothing for extraction. Run `ollama ps` while a model works: anything other than
+"100% GPU" means it is spilling to the CPU and will be several times slower.
+
 ## Layout
 
 ```
