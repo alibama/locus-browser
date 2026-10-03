@@ -1,6 +1,8 @@
 """
-locus_core — everything that is not Streamlit: helpers, SQLite store, Ollama client,
-section annotation, process compilation, matching and summaries.
+locus_core — no Streamlit, no LLM calls. Helpers + the SQLite store everything else writes to.
+
+Everything the pipeline learns is stored, keyed by content hash + model + schema version, so:
+  * re-runs are free, * two models never overwrite each other, * you can export it all for review.
 
 Config is read lazily from env so tests can redirect it:
     LOCUS_DB      SQLite file (default ./locus_process.db)
@@ -14,14 +16,12 @@ import json
 import os
 import re
 import sqlite3
-import urllib.error
-import urllib.request
 from contextlib import closing
 from pathlib import Path
 
 import pandas as pd
 
-PROMPT_VER = "v2"
+SCHEMA_VER = "v3"
 STATUSES = ["llm-draft", "reviewed-ok", "needs-work", "rejected"]
 DIMS = {
     "opacity": "Opacity — high = harder for an ordinary person to know what's required",
@@ -30,12 +30,28 @@ DIMS = {
     "problem_salience": "Problem salience — high = framed as important, urgent or threatening",
 }
 DIM_LIST = list(DIMS)
-MODALITIES = ["obligation", "prohibition", "permission", "power"]
-RENEWALS = ["annual", "biennial", "one-time", "none", "unspecified"]
-TEXT_KEYS = ("actor", "action", "condition", "deadline", "fee", "penalty")
-FACT_KEYS = ("modality", "fee_usd", "deadline_days", "renewal", "penalty_max_usd")
-
 _XML_BAD = re.compile("[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]")
+
+# Controlled subject vocabulary. Slugs are what triage tags chunks with and what becomes a
+# Wikibase "regulated subject" item; unknown subjects arrive as proposed ('new:<slug>') and wait for approval.
+SEED_SUBJECTS = {
+    "business-license": "Business license",
+    "business-license-tax": "Business license tax",
+    "business-tangible-property-tax": "Business tangible personal property tax",
+    "zoning-approval": "Zoning approval",
+    "home-occupation": "Home occupation permit",
+    "sign-permit": "Sign permit",
+    "transient-occupancy-tax": "Transient occupancy tax",
+    "short-term-rental": "Short-term rental",
+    "dog-license": "Dog license",
+    "animal-control": "Animal control",
+    "building-permit": "Building permit",
+    "alcohol-license": "Alcohol license",
+    "noise": "Noise",
+    "vehicle-storage": "Vehicle storage",
+    "food-establishment-permit": "Food establishment permit",
+    "fictitious-name": "Fictitious / assumed name registration",
+}
 
 
 def db_path() -> Path:
@@ -78,64 +94,156 @@ def section_no(header) -> str:
     return m.group(1) if m else ""
 
 
+def sec_of(row) -> str:
+    """Explicit section number if the source has one, else parse it from the header."""
+    s = clean(row.get("section_no") if hasattr(row, "get") else "").strip()
+    return s or section_no(row.get("header") if hasattr(row, "get") else "")
+
+
 def chunk_key(state, place, header, content) -> str:
     return hashlib.sha1("|".join(clean(x) for x in (state, place, header, content)).encode()).hexdigest()[:16]
+
+
+def norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", clean(s)).strip().lower()
+
+
+def quote_in(quote: str, text: str) -> bool:
+    """Is the quote (whitespace/case-insensitive) literally in the text?"""
+    q = norm_ws(quote).strip(" .…\"'“”")
+    return len(q) >= 8 and q in norm_ws(text)
 
 
 def grounded_num(val, text: str) -> str:
     """Keep a model-supplied number only if that number literally appears in the text."""
     v = re.sub(r"[^\d.]", "", clean(val))
-    if not v:
+    if not v or v == ".":
         return ""
     try:
         n = float(v)
     except ValueError:
         return ""
-    nums = re.findall(r"\d+(?:\.\d+)?", re.sub(r"(?<=\d),(?=\d)", "", clean(text)))
-    return v if any(float(d) == n for d in nums) else ""
+    t = re.sub(r"(?<=\d),(?=\d)", "", clean(text))
+    t = re.sub(r"(?<![\d])\.(\d)", r"0.\1", t)                      # ".36" -> "0.36"
+    nums = re.findall(r"\d+(?:\.\d+)?", t)
+    if any(abs(float(d) - n) < 1e-9 for d in nums):
+        return v
+    if n < 1 and re.search(rf"\b{round(n * 100)}\s*(?:cents?|¢)", t, re.I):   # 36 cents -> 0.36
+        return v
+    return ""
 
 
-# ───────────────────────────── storage (SQLite) ─────────────────────────────
+# ───────────────────────────── SQLite store ─────────────────────────────
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS markup(
+    chunk_key TEXT, pass TEXT, model TEXT, schema_ver TEXT, data TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_key, pass, model, schema_ver));
+CREATE TABLE IF NOT EXISTS relevance(
+    chunk_key TEXT, query_key TEXT, model TEXT, schema_ver TEXT, data TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chunk_key, query_key, model, schema_ver));
+CREATE TABLE IF NOT EXISTS query_interp(
+    query_key TEXT, model TEXT, schema_ver TEXT, data TEXT, created TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (query_key, model, schema_ver));
+CREATE TABLE IF NOT EXISTS regimes(
+    rkey TEXT PRIMARY KEY, state TEXT, place TEXT, query TEXT, model TEXT, schema_ver TEXT, data TEXT,
+    created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS processes(
+    pkey TEXT PRIMARY KEY, state TEXT, place TEXT, query TEXT, model TEXT, prompt_ver TEXT, data TEXT,
+    status TEXT DEFAULT 'llm-draft', note TEXT DEFAULT '', reviewer TEXT DEFAULT '',
+    updated TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS subjects(
+    slug TEXT PRIMARY KEY, label TEXT, status TEXT DEFAULT 'seed', qid TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS llm_log(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT CURRENT_TIMESTAMP, stage TEXT, model TEXT, ctx TEXT,
+    system TEXT, user TEXT, response TEXT, seconds REAL, error TEXT);
+"""
+
+
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(db_path())
-    c.executescript(
-        """CREATE TABLE IF NOT EXISTS annotations(
-               chunk_key TEXT, model TEXT, prompt_ver TEXT, data TEXT,
-               created TEXT DEFAULT CURRENT_TIMESTAMP,
-               PRIMARY KEY (chunk_key, model, prompt_ver));
-           CREATE TABLE IF NOT EXISTS processes(
-               pkey TEXT PRIMARY KEY, state TEXT, place TEXT, query TEXT, model TEXT,
-               prompt_ver TEXT, data TEXT, status TEXT DEFAULT 'llm-draft', note TEXT DEFAULT '',
-               updated TEXT DEFAULT CURRENT_TIMESTAMP);"""
-    )
+    c = sqlite3.connect(db_path(), timeout=30)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.executescript(_SCHEMA)
+    for slug_, lab in SEED_SUBJECTS.items():
+        c.execute("INSERT OR IGNORE INTO subjects(slug, label, status) VALUES (?,?, 'seed')", [slug_, lab])
+    c.commit()
     return c
 
 
-def get_annotations(keys: list[str], model: str) -> dict[str, dict]:
+def markup_get(keys: list[str], pass_: str, model: str) -> dict[str, dict]:
     out: dict[str, dict] = {}
+    if not keys:
+        return out
     with closing(_db()) as c:
         for i in range(0, len(keys), 400):
             part = keys[i:i + 400]
             qm = ",".join("?" * len(part))
             for k, d in c.execute(
-                f"SELECT chunk_key, data FROM annotations WHERE model=? AND prompt_ver=? AND chunk_key IN ({qm})",
-                [model, PROMPT_VER, *part],
-            ):
+                f"SELECT chunk_key, data FROM markup WHERE pass=? AND model=? AND schema_ver=? AND chunk_key IN ({qm})",
+                [pass_, model, SCHEMA_VER, *part]):
                 out[k] = json.loads(d)
     return out
 
 
-def save_annotation(key: str, model: str, data: dict) -> None:
+def markup_put(key: str, pass_: str, model: str, data: dict) -> None:
     with closing(_db()) as c:
-        c.execute("INSERT OR REPLACE INTO annotations(chunk_key, model, prompt_ver, data) VALUES (?,?,?,?)",
-                  [key, model, PROMPT_VER, json.dumps(data)])
+        c.execute("INSERT OR REPLACE INTO markup(chunk_key, pass, model, schema_ver, data) VALUES (?,?,?,?,?)",
+                  [key, pass_, model, SCHEMA_VER, json.dumps(data)])
+        c.commit()
+
+
+def relevance_get(keys: list[str], query_key: str, model: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    if not keys:
+        return out
+    with closing(_db()) as c:
+        for i in range(0, len(keys), 400):
+            part = keys[i:i + 400]
+            qm = ",".join("?" * len(part))
+            for k, d in c.execute(
+                f"SELECT chunk_key, data FROM relevance WHERE query_key=? AND model=? AND schema_ver=? AND chunk_key IN ({qm})",
+                [query_key, model, SCHEMA_VER, *part]):
+                out[k] = json.loads(d)
+    return out
+
+
+def relevance_put(key: str, query_key: str, model: str, data: dict) -> None:
+    with closing(_db()) as c:
+        c.execute("INSERT OR REPLACE INTO relevance(chunk_key, query_key, model, schema_ver, data) VALUES (?,?,?,?,?)",
+                  [key, query_key, model, SCHEMA_VER, json.dumps(data)])
+        c.commit()
+
+
+def query_get(query_key: str, model: str) -> dict | None:
+    with closing(_db()) as c:
+        r = c.execute("SELECT data FROM query_interp WHERE query_key=? AND model=? AND schema_ver=?",
+                      [query_key, model, SCHEMA_VER]).fetchone()
+    return json.loads(r[0]) if r else None
+
+
+def query_put(query_key: str, model: str, data: dict) -> None:
+    with closing(_db()) as c:
+        c.execute("INSERT OR REPLACE INTO query_interp(query_key, model, schema_ver, data) VALUES (?,?,?,?)",
+                  [query_key, model, SCHEMA_VER, json.dumps(data)])
+        c.commit()
+
+
+def regime_get(rkey: str) -> dict | None:
+    with closing(_db()) as c:
+        r = c.execute("SELECT data FROM regimes WHERE rkey=?", [rkey]).fetchone()
+    return json.loads(r[0]) if r else None
+
+
+def regime_put(rkey: str, state: str, place: str, query: str, model: str, data: dict) -> None:
+    with closing(_db()) as c:
+        c.execute("INSERT OR REPLACE INTO regimes(rkey, state, place, query, model, schema_ver, data) VALUES (?,?,?,?,?,?,?)",
+                  [rkey, state, place, query, model, SCHEMA_VER, json.dumps(data)])
         c.commit()
 
 
 def get_process(pkey: str) -> dict | None:
     with closing(_db()) as c:
-        r = c.execute("SELECT data, status, note FROM processes WHERE pkey=?", [pkey]).fetchone()
-    return None if r is None else {**json.loads(r[0]), "status": r[1], "note": r[2], "pkey": pkey}
+        r = c.execute("SELECT data, status, note, reviewer FROM processes WHERE pkey=?", [pkey]).fetchone()
+    return None if r is None else {**json.loads(r[0]), "status": r[1], "note": r[2], "reviewer": r[3], "pkey": pkey}
 
 
 def list_processes() -> list[dict]:
@@ -147,269 +255,153 @@ def list_processes() -> list[dict]:
 def save_process(pkey, state, place, query, model, data: dict) -> None:
     with closing(_db()) as c:
         c.execute(
-            """INSERT INTO processes(pkey, state, place, query, model, prompt_ver, data)
-               VALUES (?,?,?,?,?,?,?)
+            """INSERT INTO processes(pkey, state, place, query, model, prompt_ver, data) VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(pkey) DO UPDATE SET data=excluded.data, updated=CURRENT_TIMESTAMP""",
-            [pkey, state, place, query, model, PROMPT_VER, json.dumps(data)],
-        )
+            [pkey, state, place, query, model, SCHEMA_VER, json.dumps(data)])
         c.commit()
 
 
-def set_review(pkey: str, status: str, note: str) -> None:
+def patch_process(pkey: str, patch: dict) -> None:
     with closing(_db()) as c:
-        c.execute("UPDATE processes SET status=?, note=?, updated=CURRENT_TIMESTAMP WHERE pkey=?", [status, note, pkey])
+        r = c.execute("SELECT data FROM processes WHERE pkey=?", [pkey]).fetchone()
+        if r:
+            d = json.loads(r[0])
+            d.update(patch)
+            c.execute("UPDATE processes SET data=?, updated=CURRENT_TIMESTAMP WHERE pkey=?", [json.dumps(d), pkey])
+            c.commit()
+
+
+def set_review(pkey: str, status: str, note: str, reviewer: str = "") -> None:
+    with closing(_db()) as c:
+        c.execute("UPDATE processes SET status=?, note=?, reviewer=?, updated=CURRENT_TIMESTAMP WHERE pkey=?",
+                  [status, note, reviewer, pkey])
         c.commit()
 
 
-# ───────────────────────────── Ollama ─────────────────────────────
-class LLMUnavailable(RuntimeError):
-    pass
+def subjects(include_proposed: bool = True) -> dict[str, dict]:
+    with closing(_db()) as c:
+        rows = c.execute("SELECT slug, label, status, qid FROM subjects ORDER BY slug").fetchall()
+    return {s: {"label": l, "status": st, "qid": q} for s, l, st, q in rows if include_proposed or st != "proposed"}
 
 
-def _host(h: str) -> str:
-    h = h.strip().rstrip("/")
-    return h if h.startswith("http") else f"http://{h}"
+def subject_add(slug_: str, label_: str, status: str = "proposed") -> None:
+    with closing(_db()) as c:
+        c.execute("INSERT OR IGNORE INTO subjects(slug, label, status) VALUES (?,?,?)", [slug(slug_), label_ or slug_, status])
+        c.commit()
 
 
-def call_llm(model: str, host: str, system: str, user: str, schema: dict, timeout: int = 600) -> dict:
-    """Ollama /api/chat with a JSON-schema `format`. temperature 0 + fixed seed for repeatability."""
-    body = {
-        "model": model, "stream": False, "format": schema,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "options": {"temperature": 0, "seed": 7, "num_ctx": 8192},
+def subject_set(slug_: str, status: str | None = None, qid: str | None = None, label_: str | None = None) -> None:
+    with closing(_db()) as c:
+        if status:
+            c.execute("UPDATE subjects SET status=? WHERE slug=?", [status, slug_])
+        if qid is not None:
+            c.execute("UPDATE subjects SET qid=? WHERE slug=?", [qid, slug_])
+        if label_:
+            c.execute("UPDATE subjects SET label=? WHERE slug=?", [label_, slug_])
+        c.commit()
+
+
+def log_llm(stage: str, model: str, ctx: str, system: str, user: str, response: str, seconds: float, error: str = "") -> None:
+    try:
+        with closing(_db()) as c:
+            c.execute("INSERT INTO llm_log(stage, model, ctx, system, user, response, seconds, error) VALUES (?,?,?,?,?,?,?,?)",
+                      [stage, model, ctx, system, user, response, seconds, error])
+            c.commit()
+    except sqlite3.Error:
+        pass  # logging must never break a run
+
+
+def export_debug(pkey: str) -> dict:
+    """Everything needed to understand (or reproduce) one process — what to send back when something looks wrong."""
+    rec = get_process(pkey)
+    if rec is None:
+        return {}
+    keys = [c["key"] for c in rec.get("chunks", [])]
+    model = rec.get("model", "")
+    with closing(_db()) as c:
+        qm = ",".join("?" * len(keys)) or "''"
+        logs = c.execute(
+            f"SELECT ts, stage, model, ctx, system, user, response, seconds, error FROM llm_log WHERE ctx=? OR ctx IN ({qm}) ORDER BY id",
+            [pkey, *keys]).fetchall()
+    return {
+        "process": rec, "schema_ver": SCHEMA_VER,
+        "triage": markup_get(keys, "triage", model), "extract": markup_get(keys, "extract", model),
+        "relevance": relevance_get(keys, rec.get("query_key", ""), model),
+        "llm_log": [dict(zip(("ts", "stage", "model", "ctx", "system", "user", "response", "seconds", "error"), r)) for r in logs],
     }
-    req = urllib.request.Request(_host(host) + "/api/chat", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    last: Exception | None = None
-    for _ in range(2):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.load(r)
-            return json.loads(data["message"]["content"])
-        except urllib.error.URLError as e:
-            raise LLMUnavailable(f"Cannot reach Ollama at {host}: {e.reason}") from e
-        except (json.JSONDecodeError, KeyError) as e:
-            last = e
-    raise ValueError(f"Model returned unusable JSON: {last}")
 
 
-def ollama_models(host: str) -> list[str]:
-    with urllib.request.urlopen(_host(host) + "/api/tags", timeout=5) as r:
-        return [m["name"] for m in json.load(r).get("models", [])]
+# ───────────────────────────── candidates ─────────────────────────────
+def _terms(query: str) -> list[str]:
+    return [t for t in re.split(r"\s+", query.lower().strip()) if t]
 
 
-_STR = {"type": "string"}
-_STEP_PROPS = {k: _STR for k in (*TEXT_KEYS, "fee_usd", "deadline_days", "penalty_max_usd")}
-_STEP_PROPS["modality"] = {"type": "string", "enum": MODALITIES}
-_STEP_PROPS["renewal"] = {"type": "string", "enum": RENEWALS}
-EXTRACT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "summary": _STR,
-        "role": {"type": "string", "enum": ["requirement", "procedure", "exemption", "penalty", "definition", "other"]},
-        "steps": {"type": "array", "maxItems": 4, "items": {
-            "type": "object", "properties": _STEP_PROPS, "required": list(_STEP_PROPS)}},
-        "refs": {"type": "array", "items": _STR},
-    },
-    "required": ["summary", "role", "steps", "refs"],
-}
-COMPILE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title": _STR,
-        "nodes": {"type": "array", "maxItems": 24, "items": {
-            "type": "object",
-            "properties": {
-                "id": _STR, "type": {"type": "string", "enum": ["task", "gateway", "end"]},
-                "actor": _STR, "label": _STR, "sources": {"type": "array", "items": _STR}},
-            "required": ["id", "type", "actor", "label", "sources"]}},
-        "edges": {"type": "array", "items": {
-            "type": "object", "properties": {"from": _STR, "to": _STR, "label": _STR},
-            "required": ["from", "to"]}},
-    },
-    "required": ["title", "nodes", "edges"],
-}
-EXTRACT_SYSTEM = (
-    "You extract structured facts from ONE section of a US municipal or county ordinance. "
-    "Use only the text given. If something is not stated, return an empty string — never guess amounts, "
-    "deadlines or offices. 'actor' is the person or office that must act or may act, as a short consistent "
-    "role name (e.g. 'Dog owner', 'City treasurer', 'Animal control officer', 'Court'). 'action' is an "
-    "imperative phrase of at most 12 words. 'summary' is one plain-English sentence a non-lawyer can follow. "
-    "'refs' lists other section numbers this section points to. A section with no actionable step "
-    "(definitions, purpose) returns an empty steps list. "
-    "Typed fields: fee_usd, deadline_days and penalty_max_usd are digits only, copied from the text "
-    "(e.g. '10', '30'); leave them empty if the text gives no such number or it is not dollars/days. "
-    "'modality': obligation (must/shall), prohibition (shall not/unlawful), permission (may), power (an "
-    "office is authorised to act). 'renewal': annual only if the license or permit must be renewed every "
-    "year, biennial every two years, one-time if issued once, none if it does not expire, else unspecified."
-)
-COMPILE_SYSTEM = (
-    "You assemble extracted ordinance steps into ONE process model a lawyer can check. Use ONLY the steps "
-    "given; never add steps, amounts or deadlines. Node types: 'task' (an actor does something), "
-    "'gateway' (a yes/no or multi-way question; label it as a question and label every outgoing edge with "
-    "the answer), 'end' (an outcome such as 'License issued' or 'Citation issued'). Every task node must "
-    "list the step codes (like c3.1) it comes from in 'sources'. Order the nodes by the logical sequence "
-    "implied by deadlines, conditions and cross-references (refs), not by section order. Keep the same actor "
-    "name for the same role. Penalty steps belong after a gateway such as 'Complied?'. If the text gives no "
-    "basis for connecting two steps, do not invent a connection. At most 18 nodes."
-)
-
-
-def norm_annotation(d: dict, text: str = "") -> dict:
-    steps = []
-    for s in d.get("steps", []) or []:
-        st = {k: clean(s.get(k)).strip() for k in TEXT_KEYS}
-        if not st["action"]:
-            continue
-        st["fee_usd"] = grounded_num(s.get("fee_usd"), f"{st['fee']} {text}")
-        st["deadline_days"] = grounded_num(s.get("deadline_days"), f"{st['deadline']} {text}")
-        st["penalty_max_usd"] = grounded_num(s.get("penalty_max_usd"), f"{st['penalty']} {text}")
-        mod, ren = clean(s.get("modality")), clean(s.get("renewal"))
-        st["modality"] = mod if mod in MODALITIES else ""
-        st["renewal"] = ren if ren in RENEWALS else "unspecified"
-        steps.append(st)
-    return {"summary": clean(d.get("summary")).strip(), "role": clean(d.get("role")) or "other",
-            "steps": steps, "refs": [clean(r).strip() for r in d.get("refs", []) or []]}
-
-
-def annotate(rows: pd.DataFrame, model: str, host: str, progress=None) -> list[str]:
-    errs: list[str] = []
-    n = len(rows)
-    for i, (_, r) in enumerate(rows.iterrows()):
-        user = (f"Jurisdiction: {r['place']}, {r['state'].upper()}\nSection: {label(r['header'], 160)}\n\n"
-                f"Text:\n{clean(r['content'])[:3500]}")
-        try:
-            data = call_llm(model, host, EXTRACT_SYSTEM, user, EXTRACT_SCHEMA)
-            save_annotation(r["ckey"], model, norm_annotation(data, clean(r["content"])))
-        except LLMUnavailable as e:
-            errs.append(str(e))
-            break
-        except Exception as e:  # noqa: BLE001
-            errs.append(f"{label(r['header'], 50)}: {e}")
-        if progress:
-            progress.progress((i + 1) / n, text=f"Annotated {i + 1}/{n}")
-    return errs
-
-
-def process_key(state, place, query, model, ckeys) -> str:
-    return hashlib.sha1("|".join([state, place, query.strip().lower(), model, PROMPT_VER, *sorted(ckeys)]).encode()).hexdigest()[:20]
-
-
-def compile_process(chunks: pd.DataFrame, anns: dict, state: str, place: str, query: str, model: str, host: str) -> str:
-    lines, steps_rec = [], []
-    for _, r in chunks.iterrows():
-        a = anns.get(r["ckey"])
-        for j, s in enumerate((a or {}).get("steps", []), 1):
-            code = f"{r['code']}.{j}"
-            steps_rec.append({"code": code, "chunk": r["code"], **s})
-            lines.append(" | ".join([
-                code, f"§{section_no(r['header']) or '?'}", f"actor: {s['actor'] or '?'}", f"action: {s['action']}",
-                f"if: {s['condition']}" if s["condition"] else "if: -", f"due: {s['deadline'] or '-'}",
-                f"fee: {s['fee'] or '-'}", f"penalty: {s['penalty'] or '-'}",
-                f"refs: {', '.join(a['refs']) or '-'}"]))
-    if not lines:
-        raise ValueError("No extracted steps to compile. Annotate first (some sections have no actionable step).")
-    user = f"Jurisdiction: {place}, {state.upper()}\nTopic: {query}\n\nSteps:\n" + "\n".join(lines)
-    graph = call_llm(model, host, COMPILE_SYSTEM, user, COMPILE_SCHEMA)
-    chunk_recs = [
-        {"code": r["code"], "key": r["ckey"], "header": clean(r["header"]), "section": section_no(r["header"]),
-         "fn": r["fn"], "topic": clean(r["topic"]), "text": clean(r["content"])[:2500],
-         **{d: (None if pd.isna(r[d]) else float(r[d])) for d in DIM_LIST}}
-        for _, r in chunks.iterrows()
-    ]
-    pkey = process_key(state, place, query, model, chunks["ckey"].tolist())
-    save_process(pkey, state, place, query, model, {
-        "graph": graph, "chunks": chunk_recs, "steps": steps_rec, "model": model, "prompt_ver": PROMPT_VER,
-        "state": state, "place": place, "query": query})
-    return pkey
-
-
-# ───────────────────────────── graph normalisation ─────────────────────────────
-def normalize_graph(g: dict, chunk_codes: set[str], step_codes: set[str] | None = None):
-    """Sanitise an LLM graph. Node 'sources' become chunk codes; 'steps' are the cited step codes."""
-    step_codes = step_codes or set()
-    nodes: dict[str, dict] = {}
-    order: list[str] = []
-    for n in g.get("nodes", []) or []:
-        nid = clean(n.get("id")).strip()
-        if not nid or nid in nodes:
-            continue
-        t = n.get("type") if n.get("type") in ("task", "gateway", "end") else "task"
-        srcs, steps = [], []
-        for s in n.get("sources", []) or []:
-            code = clean(s).strip()
-            base = code.split(".")[0]
-            if code in step_codes and code not in steps:
-                steps.append(code)
-            if base in chunk_codes and base not in srcs:
-                srcs.append(base)
-        nodes[nid] = {"id": nid, "type": t, "actor": clean(n.get("actor")).strip(),
-                      "label": clean(n.get("label")).strip() or nid, "sources": srcs, "steps": steps}
-        order.append(nid)
-    edges, seen, dropped = [], set(), 0
-    for e in g.get("edges", []) or []:
-        a, b = clean(e.get("from")).strip(), clean(e.get("to")).strip()
-        if a in nodes and b in nodes and a != b and (a, b) not in seen and nodes[a]["type"] != "end":
-            edges.append({"src": a, "tgt": b, "label": clean(e.get("label")).strip()})
-            seen.add((a, b))
-        else:
-            dropped += 1
-    return nodes, order, edges, dropped
-
-
-def node_facts(nd: dict, steps_by_code: dict) -> dict:
-    """First non-empty typed/text fact across the steps a node cites."""
-    out: dict[str, str] = {}
-    for k in (*FACT_KEYS, "condition", "fee", "deadline", "penalty"):
-        for c in nd.get("steps", []):
-            v = steps_by_code.get(c, {}).get(k, "")
-            if v and v != "unspecified":
-                out[k] = v
-                break
-    return out
-
-
-# ───────────────────────────── matching + summaries ─────────────────────────────
-def get_matches(df: pd.DataFrame, query: str, fns: list[str], cap: int) -> pd.DataFrame:
-    terms = [t for t in re.split(r"\s+", query.lower().strip()) if t]
-    if df.empty or not terms:
-        return df.iloc[0:0].assign(place=[], ckey=[], code=[])
+def score_frame(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    terms = _terms(query)
     head = df["header"].fillna("").str.lower()
     hay = head + " " + df["content"].fillna("").str.lower()
     mask = pd.Series(True, index=df.index)
     for t in terms:
         mask &= hay.str.contains(re.escape(t))
-    m = df[mask & df["fn"].isin(fns)].copy()
-    m["_h"] = sum(head[m.index].str.contains(re.escape(t)).astype(int) for t in terms)
-    m = m.sort_values("_h", ascending=False, kind="stable").head(cap).sort_index().drop(columns="_h")
-    m["place"] = m["city"].fillna(m["county"])
+    out = df[mask].copy()
+    out["_score"] = sum(head[out.index].str.contains(re.escape(t)).astype(int) for t in terms) if terms else 0
+    return out
+
+
+def build_candidates(frames: dict[str, pd.DataFrame], query: str, caps: dict[str, int], fns: list[str]) -> pd.DataFrame:
+    """frames: level -> unified frame (already filtered/ranked for state/federal). Adds ckey + code."""
+    parts = []
+    for level in ("local", "state", "federal"):
+        df = frames.get(level)
+        if df is None or df.empty or caps.get(level, 0) <= 0:
+            continue
+        if level == "local":
+            m = score_frame(df, query)
+            m = m[m["fn"].isin(fns)]
+            m = m.sort_values("_score", ascending=False, kind="stable").head(caps[level]).sort_index().drop(columns="_score")
+        else:
+            m = df.head(caps[level]).copy()
+        parts.append(m)
+    if not parts:
+        return pd.DataFrame(columns=["header", "content", "level", "ckey", "code", "place", "state"])
+    m = pd.concat(parts, ignore_index=True)
+    m["place"] = m["place"].fillna("")
     m["ckey"] = [chunk_key(r.state, r.place, r.header, r.content) for r in m.itertuples()]
     m["code"] = [f"c{i + 1}" for i in range(len(m))]
     return m
 
 
-def summarize(m: pd.DataFrame, anns: dict) -> dict:
-    steps = [s for k in m["ckey"] for s in anns.get(k, {}).get("steps", [])]
-    done = bool(anns)
+def summarize(m: pd.DataFrame, extracts: dict[str, dict], model: str = "") -> dict:
+    """One column of the compare table from stored extractions (no LLM)."""
+    rules, rows = [], []
+    for k in m["ckey"]:
+        e = extracts.get(k) or {}
+        rules += e.get("rules", [])
+        rows += e.get("rows", [])
+    done = bool(extracts)
 
     def join(vals, fmt=str):
         u = []
         for v in vals:
             if v and v not in u:
                 u.append(v)
-        return "; ".join(fmt(v) for v in u) if u else ("—" if done else "(not annotated)")
+        return "; ".join(fmt(v) for v in u) if u else ("—" if done else "(not run)")
 
+    flat = [r["amount_value"] for r in rules if r.get("amount_kind") == "flat_fee"] + \
+           [r["amount_value"] for r in rows if r.get("amount_kind") == "flat_fee"]
+    pct = [r["amount_value"] for r in rules if r.get("amount_kind") == "percent_of_base"] + \
+          [r["amount_value"] for r in rows if r.get("amount_kind") == "percent_of_base"]
+    thr = [f"{r['threshold_variable']} {r['threshold_op']} {r['threshold_value']}".strip() for r in rules if r.get("threshold_value")]
     return {
-        "Matches": len(m),
-        "Rules": int((m["fn"] == "Rules").sum()), "Process": int((m["fn"] == "Process").sum()),
-        "Enforcement": int((m["fn"] == "Enforcement").sum()),
-        "Mean opacity z": round(float(m["opacity"].mean()), 2) if len(m) else None,
-        "Mean discretion z": round(float(m["enforcement_discretion"].mean()), 2) if len(m) else None,
-        "Fee (USD)": join([s["fee_usd"] for s in steps], lambda v: f"${v}"),
-        "Fee (as written)": join([s["fee"] for s in steps]),
-        "Deadline (days)": join([s["deadline_days"] for s in steps]),
-        "Deadline (as written)": join([s["deadline"] for s in steps]),
-        "Renewal": join([s["renewal"] for s in steps if s["renewal"] != "unspecified"]),
-        "Max penalty (USD)": join([s["penalty_max_usd"] for s in steps], lambda v: f"${v}"),
-        "Penalty (as written)": join([s["penalty"] for s in steps]),
+        "Model": model or "—",
+        "Sections": len(m),
+        "…local / state / federal": " / ".join(str(int((m["level"] == l).sum())) for l in ("local", "state", "federal")) if len(m) else "0 / 0 / 0",
+        "Flat fee (USD)": join(flat, lambda v: f"${v}"),
+        "Rate (% of base)": join(pct, lambda v: f"{v}%"),
+        "Thresholds": join(thr),
+        "Deadline (days)": join([r.get("deadline_days") for r in rules]),
+        "Fixed due date": join([r.get("deadline_fixed") for r in rules]),
+        "Renewal": join([r.get("renewal") for r in rules if r.get("renewal") not in (None, "", "unspecified")]),
+        "Max penalty": join([f"{r['penalty_max_value']} {r.get('penalty_unit', '')}".strip() for r in rules if r.get("penalty_max_value")]),
+        "Fees as written": join([r.get("amount_text") for r in rules]),
     }

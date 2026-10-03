@@ -5,7 +5,8 @@ from xml.sax.saxutils import escape, quoteattr
 
 import pandas as pd
 
-from locus_core import DIM_LIST, FACT_KEYS, PROMPT_VER, clean, label, node_facts, normalize_graph, sid
+from locus_core import DIM_LIST, SCHEMA_VER, clean, label, sid
+from locus_markup import node_facts, normalize_graph
 
 # (fill, stroke) for high / mid / low bins of a z-score
 PALETTE = {
@@ -14,6 +15,10 @@ PALETTE = {
 }
 UNSOURCED = ("#f3f4f6", "#6b7280")
 KIND_TAG = {"start": "bpmn:startEvent", "end": "bpmn:endEvent", "task": "bpmn:userTask", "gateway": "bpmn:exclusiveGateway"}
+# verdict from the verifier overrides colour: (fill, stroke)
+VERDICT_STYLE = {"unsupported": ("#fecaca", "#7f1d1d"), "partial": (None, "#d97706")}
+FACT_KEYS = ("modality", "condition", "deadline_days", "deadline_fixed", "amount_kind", "amount_value", "amount_unit",
+             "amount_base", "threshold", "penalty_text", "penalty_max_value", "penalty_unit", "renewal")
 TW, TH, ROWH, COLW, BAND = 160, 84, 108, 230, 30
 
 
@@ -27,8 +32,10 @@ def bin_for(dim: str, z):
 def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | None):
     """Return (xml, element_meta, warnings). Deterministic for a given stored record."""
     chunks = {c["code"]: c for c in rec["chunks"]}
-    steps_by_code = {s["code"]: s for s in rec.get("steps", [])}
-    nodes, order, edges, dropped = normalize_graph(rec["graph"], set(chunks), set(steps_by_code))
+    rules_by = {r["code"]: r for r in rec.get("rules", [])}
+    decisions = {d["id"]: d for d in rec.get("decisions", [])}
+    verdicts = rec.get("verdicts", {})
+    nodes, order, edges, dropped = normalize_graph(rec["graph"], set(chunks), set(rules_by), set(decisions))
     warnings = [f"{dropped} edge(s) dropped (unknown or invalid node ids)."] if dropped else []
     if not nodes:
         return None, [], ["The model returned no nodes."]
@@ -40,7 +47,7 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
     for n in [n for n in nodes if n not in order]:
         del nodes[n]
     S, E = "__start", "__end"
-    nodes[S] = {"id": S, "type": "start", "actor": "", "label": "Start", "sources": [], "steps": []}
+    nodes[S] = {"id": S, "type": "start", "actor": "", "label": "Start", "sources": [], "rules": [], "decision": ""}
     inc = {n: 0 for n in nodes}
     for e in edges:
         inc[e["tgt"]] += 1
@@ -52,7 +59,7 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
     need_end = [n for n in order if nodes[n]["type"] != "end" and (outc[n] == 0 or (nodes[n]["type"] == "gateway" and outc[n] < 2))]
     all_order = [S] + order
     if need_end:
-        nodes[E] = {"id": E, "type": "end", "actor": "", "label": "End", "sources": [], "steps": []}
+        nodes[E] = {"id": E, "type": "end", "actor": "", "label": "End", "sources": [], "rules": [], "decision": ""}
         all_order.append(E)
         edges += [{"src": n, "tgt": E, "label": "Otherwise" if nodes[n]["type"] == "gateway" else ""} for n in need_end]
 
@@ -140,26 +147,39 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
     for n in topo:
         nd = nodes[n]
         srcs = [chunks[c] for c in nd["sources"]]
-        facts = node_facts(nd, steps_by_code)
+        facts = node_facts(nd, rules_by)
+        vs = [verdicts.get(c, {}).get("verdict") for c in nd["rules"]]
+        nd["_verdict"] = ("unsupported" if "unsupported" in vs else "partial" if "partial" in vs
+                          else "supported" if vs and all(v == "supported" for v in vs) else "")
+        if nd["type"] == "task" and nd["_verdict"] == "unsupported":
+            warnings.append(f"Unsupported by its source: “{nd['label'][:60]}” (verifier said the text does not state it).")
         mean = {d: (float(pd.Series([s[d] for s in srcs if s.get(d) is not None]).mean()) if any(s.get(d) is not None for s in srcs) else None)
                 for d in DIM_LIST}
         nd["_mean"] = mean
         if nd["type"] == "task" and not srcs:
             warnings.append(f"Unsourced task: “{nd['label'][:60]}” (drawn grey — treat as unverified).")
-        shown = [("Modality", facts.get("modality")), ("Fee (USD)", facts.get("fee_usd")), ("Fee as written", facts.get("fee")),
-                 ("Deadline (days)", facts.get("deadline_days")), ("Deadline as written", facts.get("deadline")),
-                 ("Renewal", facts.get("renewal")), ("Max penalty (USD)", facts.get("penalty_max_usd")),
-                 ("Penalty as written", facts.get("penalty")), ("Condition", facts.get("condition"))]
+        shown = [("Modality", facts.get("modality")), ("Condition", facts.get("condition")),
+                 ("Amount", " ".join(filter(None, [facts.get("amount_kind"), facts.get("amount_value"), facts.get("amount_unit"),
+                                                   ("of " + facts["amount_base"]) if facts.get("amount_base") else ""]))),
+                 ("Amount as written", facts.get("amount_text")), ("Threshold", facts.get("threshold")),
+                 ("Deadline (days)", facts.get("deadline_days")), ("Due date", facts.get("deadline_fixed")),
+                 ("Renewal", facts.get("renewal")), ("Penalty", facts.get("penalty_text")),
+                 ("Max penalty", " ".join(filter(None, [facts.get("penalty_max_value"), facts.get("penalty_unit")]))),
+                 ("Decision table", f"{decisions[nd['decision']]['id']} {decisions[nd['decision']]['name']}" if nd["decision"] else "")]
         details = "; ".join(f"{k}: {v}" for k, v in shown if v)
-        doc = "\n\n".join(filter(None, [details] + [f"[§{s['section'] or '?'} {label(s['header'], 80)}] {s['text'][:700]}" for s in srcs]))
+        ev = [f"[{c}] verdict={verdicts[c]['verdict']}" + (f" — “{verdicts[c]['quote']}”" if verdicts[c].get("quote") else "")
+              for c in nd["rules"] if c in verdicts]
+        doc = "\n\n".join(filter(None, [details, "\n".join(ev)] + [f"[§{s['section'] or '?'} {label(s['header'], 80)}] {s['text'][:700]}" for s in srcs]))
         attrs = {"actor": nd["actor"], "chunks": ",".join(s["key"] for s in srcs),
                  "sections": ", ".join(s["section"] for s in srcs if s["section"]),
-                 **{k: facts.get(k) for k in FACT_KEYS}, "condition": facts.get("condition"),
+                 **{k: facts.get(k) for k in FACT_KEYS},
+                 "levels": ",".join(sorted({s["level"] for s in srcs})), "citations": " | ".join(s["citation"] for s in srcs if s.get("citation")),
+                 "verdict": nd["_verdict"], "decision": nd["decision"],
                  **{d: (None if mean[d] is None else round(mean[d], 3)) for d in DIM_LIST},
                  "provenance": "llm-extracted" if srcs else "unsourced"}
         if n not in (S, E):
             meta.append({"id": nid[n], "type": nd["type"], "label": nd["label"], **{k: v for k, v in attrs.items() if v not in (None, "")}})
-        node_xml[n] = (doc, attrs, srcs, bool(details))
+        node_xml[n] = (doc, attrs, srcs, bool(details or ev))
 
     o = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -177,7 +197,7 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
         f"    <bpmn:documentation>{escape(clean(rec['graph'].get('title', '')))}</bpmn:documentation>",
         "    <bpmn:extensionElements>",
         f'      <lex:jurisdiction state={quoteattr(state)} place={quoteattr(clean(place))} source="LocalLaws/LOCUS-v1" query={quoteattr(clean(query))}/>',
-        f'      <lex:generator name="locus_explorer" version="0.3" model={quoteattr(clean(rec.get("model", "")))} promptVersion={quoteattr(PROMPT_VER)} reviewStatus={quoteattr(rec.get("status", "llm-draft"))}/>',
+        f'      <lex:generator name="locus_explorer" version="0.4" model={quoteattr(clean(rec.get("model", "")))} schemaVersion={quoteattr(SCHEMA_VER)} verifier={quoteattr(clean(rec.get("verifier", "")))} reviewStatus={quoteattr(rec.get("status", "llm-draft"))}/>',
         "    </bpmn:extensionElements>",
         f'    <bpmn:laneSet id="{pid}_lanes">',
     ]
@@ -190,7 +210,7 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
     for n in topo:
         nd = nodes[n]
         doc, attrs, srcs, has_details = node_xml[n]
-        tag = KIND_TAG[nd["type"]]
+        tag = "bpmn:businessRuleTask" if nd.get("decision") else KIND_TAG[nd["type"]]
         o.append(f'    <{tag} id="{nid[n]}" name={quoteattr(clean(nd["label"]))}>')
         if srcs or has_details:
             o.append(f"      <bpmn:documentation>{escape(clean(doc))}</bpmn:documentation>")
@@ -217,6 +237,9 @@ def emit_bpmn(rec: dict, state: str, place: str, query: str, color_dim: str | No
         col = ""
         if nd["type"] == "task":
             b = UNSOURCED if not nd["sources"] else (bin_for(color_dim, nd["_mean"].get(color_dim)) if color_dim else None)
+            vs_ = VERDICT_STYLE.get(nd["_verdict"])
+            if vs_ and nd["sources"]:
+                b = (vs_[0] or (b[0] if b else "#ffffff"), vs_[1])
             if b:
                 col = f' bioc:fill="{b[0]}" bioc:stroke="{b[1]}"'
         o += [f'      <bpmndi:BPMNShape id="{nid[n]}_di" bpmnElement="{nid[n]}"{extra}{col}>',

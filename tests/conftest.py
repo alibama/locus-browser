@@ -18,10 +18,15 @@ def ollama():
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch, ollama):
+    import fake_ollama
     import make_synthetic
+    fake_ollama.reset()
     pq = make_synthetic.make(tmp_path / "syn.parquet")
+    oul = make_synthetic.make_oul(tmp_path / "us_va_statutes.parquet")
     monkeypatch.setenv("LOCUS_SRC", str(pq))
     monkeypatch.setenv("LOCUS_SLIM", str(tmp_path / "none.parquet"))
     monkeypatch.setenv("LOCUS_DB", str(tmp_path / "t.db"))
     monkeypatch.setenv("OLLAMA_HOST", ollama)
-    return {"pq": pq, "host": ollama, "model": "qwen2.5:7b"}
+    monkeypatch.setenv("OUL_TEMPLATE", str(tmp_path / "us_{jur}_{corpus}.parquet"))
+    return {"pq": pq, "oul": oul, "host": ollama, "model": "qwen2.5:7b", "tmp": tmp_path,
+            "template": str(tmp_path / "us_{jur}_{corpus}.parquet")}

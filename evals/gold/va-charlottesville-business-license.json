@@ -1,0 +1,18 @@
+{
+  "_status": "REFERENCE-UNVERIFIED: compiled from the city's own pages (charlottesville.gov / charlottesville.org, 2026 forms) by an assistant. Needs a lawyer's sign-off and a check of which facts actually live in the municipal code vs forms/state law before it is used as ground truth.",
+  "jurisdiction": "va/charlottesville",
+  "topic": "business license (new business)",
+  "applicant_facts": [
+    {"id": "who",       "text": "Application goes to the Commissioner of the Revenue", "patterns": ["commissioner of (the )?revenue"], "kind": "actor"},
+    {"id": "deadline",  "text": "New application due within 30 days of establishing the business", "patterns": ["\\b30\\b"], "kind": "deadline_days", "expect": 30},
+    {"id": "zoning",    "text": "Zoning approval is required before operating", "patterns": ["zon(ing|ed)"], "kind": "precondition"},
+    {"id": "scc",       "text": "Assumed/fictitious names registered with the State Corporation Commission", "patterns": ["state corporation commission|\\bSCC\\b|fictitious|assumed name"], "kind": "precondition"},
+    {"id": "flat35",    "text": "Flat $35 fee if gross receipts are $50,000 or less", "patterns": ["\\$?\\b35\\b"], "kind": "fee_usd", "expect": 35},
+    {"id": "flat50",    "text": "Flat $50 fee if gross receipts are $50,001-$100,000", "patterns": ["\\$?\\b50\\b"], "kind": "fee_usd", "expect": 50},
+    {"id": "over100k",  "text": "Over $100,000: the tax rate for the business class applies", "patterns": ["100,?000"], "kind": "threshold"},
+    {"id": "estimate",  "text": "First year is based on estimated gross receipts; later years on the prior year", "patterns": ["estimat"], "kind": "basis"},
+    {"id": "renewal",   "text": "License renews annually", "patterns": ["annual|renew"], "kind": "renewal"},
+    {"id": "penalty",   "text": "Late filing/payment: 10% penalty plus 8% annual interest", "patterns": ["\\b10 ?%|ten percent", "\\b8 ?%|eight percent"], "kind": "penalty"}
+  ],
+  "rate_facts_that_must_not_be_flat_fees": ["per hundred", "per \\$100", "cents per"]
+}

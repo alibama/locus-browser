@@ -1,73 +1,88 @@
 # LOCUS explorer
 
-Explore [LocalLaws/LOCUS-v1](https://huggingface.co/datasets/LocalLaws/LOCUS-v1) (Peskoff et al., arXiv 2606.19334),
-compare the same topic across municipalities, and turn local-ordinance text into reviewable BPMN process models
-that can feed [Lexipedia](https://lexipedia.xyz).
+Explore local ordinances ([LocalLaws/LOCUS-v1](https://huggingface.co/datasets/LocalLaws/LOCUS-v1)) together with state and
+federal law ([vaquill/open-us-law](https://huggingface.co/datasets/vaquill/open-us-law)), compare the same topic across
+places and across **two models at once**, and turn the text into marked-up, verified, reviewable BPMN/DMN process models that
+can feed [Lexipedia](https://lexipedia.xyz).
 
 ## Quick start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-ollama pull qwen2.5:7b            # any model; configurable in the sidebar
+export HF_TOKEN=...            # open-us-law is gated: accept its conditions on the Hub first
+ollama pull qwen2.5:7b         # or pull from the app's Models panel
 streamlit run locus_explorer.py
 ```
 
-Env vars: `HF_TOKEN` (if gated), `LOCUS_SRC` (parquet path / glob / `hf://` glob), `LOCUS_SLIM`, `LOCUS_DB`,
-`OLLAMA_HOST`, `OLLAMA_MODEL`. The default source glob is a guess at the Hub layout; change it in the sidebar if needed.
-Click **Build slim cache** once so the national views don't re-read 2.2M rows of text.
+Env: `HF_TOKEN`, `LOCUS_SRC`, `LOCUS_SLIM`, `LOCUS_DB`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OUL_TEMPLATE`.
+The default LOCUS glob and open-us-law file template (`us_{jurisdiction}_{corpus}.parquet`) come from the dataset cards, not from
+a directory listing; both are editable in the sidebar.
 
-## What it does
+## What's in the app
 
 | Tab | |
 |---|---|
-| National view | state choropleths of the four LOCUS dimensions, city-vs-county comparison |
-| Jurisdiction | composition, dimensions by topic, hardest-to-read provisions |
-| Provisions | searchable text browser |
-| Process builder | annotate → compile → review for one place |
-| Compare | same topic across 2–8 places (you choose how many): fee / deadline / renewal / penalty table + processes |
+| National view | state choropleths of the four LOCUS dimensions, city-vs-county (LOCUS only) |
+| Jurisdiction / Provisions | composition, dimensions, hardest-to-read sections, text browser |
+| Process builder | one place, one or two models: markup → relevance → extract → outline → compile → verify |
+| Compare | N places (2-8) × 1-2 models, side by side, with a fee/rate/deadline/penalty table and a model-agreement table |
+| Library | controlled subject registry (links to Wikibase QIDs), stored processes, debug bundles |
 
-### The process pipeline
+### Models panel (sidebar)
 
-1. **Annotate** – Ollama reads each matching section (JSON-schema constrained, temperature 0, fixed seed) and
-   extracts a plain-English summary and steps: actor, action, condition, deadline, fee, penalty, plus typed
-   values (fee USD, deadline days, renewal, max penalty, deontic modality). Typed numbers are kept only if they
-   literally appear in the source text.
-2. **Compile** – a second pass assembles the steps into one graph (tasks, gateways, outcomes) ordered by deadlines,
-   conditions and cross-references. Nodes cite step codes; unknown IDs and bad edges are dropped.
-3. **Draw** – deterministic BPMN 2.0 with a lane per actor. Grey box = no source cited. Fill can show the mean
-   LOCUS score (e.g. opacity) of the cited provisions.
-4. **Review** – status `llm-draft → reviewed-ok / needs-work / rejected` stored in SQLite.
-5. **Export (dry run)** – only `reviewed-ok` processes: item bundle + QuickStatements in two passes. See
-   [docs/wikibase-mapping.md](docs/wikibase-mapping.md).
+* Shows whether Ollama is reachable; **Start Ollama here** (local only) and an install link if it is not.
+* Lists installed models; for any model you type that is missing, **Pull** streams `ollama pull` with a progress bar.
+* **Self-test** checks that a model can follow a JSON schema at all (small models sometimes cannot).
+* **Model B** runs at the same time as Model A (one worker thread per model); an optional **verifier** model checks the extractor's work.
+* Everything stored stays viewable with the server down; only running new stages needs a model.
 
-Everything the model produced is cached in SQLite keyed by chunk hash + model + prompt version, so a stored process
-re-renders identically and nothing is re-run.
+### The markup pipeline
+
+See [docs/markup-schema.md](docs/markup-schema.md). In short: deterministic quality check → triage (role, audience, subjects, regime,
+summary) → relevance for *your* topic (with a stored reason) → role-routed typed extraction (rules / rate tables / definitions, each
+with a verbatim evidence quote) → regime outline (phases, excluded, **missing**) → compile → verify (the verifier must quote the text;
+the quote is checked). Rates are never flat fees; numbers must appear in the source; unsupported steps turn red.
+
+### Sending samples back
+
+Every process has a **Debug bundle** download (all stage outputs plus every prompt and raw model response). That is the thing to
+send when a result looks wrong.
 
 ## Layout
 
 ```
-locus_explorer.py    Streamlit UI + DuckDB access
-locus_core.py        helpers, SQLite store, Ollama client, annotate/compile, matching
-locus_bpmn.py        BPMN 2.0 emitter (lanes by actor)
+locus_explorer.py    Streamlit UI
+locus_core.py        helpers + SQLite store (markup, relevance, regimes, processes, subjects, llm_log)
+locus_sources.py     LOCUS + open-us-law -> one provision shape
+locus_llm.py         Ollama client, status/start/pull/self-test, call logging
+locus_markup.py      vocabularies, schemas, prompts, stages, parallel runner, model agreement
+locus_bpmn.py        BPMN 2.0 emitter (lanes by actor, verdict colouring)
+locus_dmn.py         rate tables -> DMN decision tables
 lexipedia_export.py  bundle + QuickStatements; CLI: check | list | export
 properties.json      Wikibase property map (existing + proposed)
-tests/               pytest with a fake Ollama and a synthetic LOCUS-shaped parquet
+evals/               lint_process.py + a gold template (see below)
+tests/               pytest with a fake Ollama and synthetic data
+docs/                markup-schema.md, wikibase-mapping.md
 ```
 
-## Tests
+## Tests and evals
 
 ```bash
 pytest -q
+python evals/lint_process.py --bpmn x.bpmn --sidecar x.json [--bundle b.json] [--pass1 p1.qs] [--gold evals/gold/....json]
 ```
 
-The tests run the whole flow against a fake Ollama server and synthetic data. They do **not** cover a real model's
-output quality, the real dataset, the BPMN viewer in a browser, or a live Wikibase.
+`pytest` runs the whole pipeline against a fake Ollama: two models in flight at once, the pull flow, an unreachable server, grounding,
+verification downgrades, DMN/BPMN well-formedness, the export gate. It does **not** measure a real model's quality, run against the real
+datasets, or exercise the BPMN viewer in a browser. The lint finds known failure patterns; the gold file is an unverified reference
+that needs a lawyer's sign-off.
 
 ## Caveats
 
-- A 7B model will misread some sections. Treat output as a draft for a lawyer; the plain-English summary and source
-  text sit next to every step for that reason.
-- Row order in LOCUS is assumed to be code order in one chart; verify.
-- Long edges across several columns in the BPMN can pass behind a box.
-- Check the dataset's licence before redistributing text derived from it.
+* A small model will misread some sections. Treat output as a draft; summaries, evidence quotes and verdicts sit next to every step.
+* open-us-law file names for federal law are not known to me; set the code in the sidebar after checking the Files tab.
+* Retrieval of state law is keyword-and-title ranked, then the LLM relevance pass filters; use "Always include citations containing"
+  to pin a known authority.
+* LOCUS's licence still needs checking before redistributing derived text. open-us-law is CC BY 4.0 for the compilation, with public-domain text.
+* Long edges across columns in the BPMN can pass behind a box.

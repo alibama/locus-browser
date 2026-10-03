@@ -22,7 +22,8 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from locus_core import get_process, label, list_processes, node_facts, normalize_graph, slug
+from locus_core import get_process, label, list_processes, slug, subjects
+from locus_markup import node_facts, normalize_graph
 
 HERE = Path(__file__).parent
 
@@ -32,6 +33,10 @@ def load_props(path: str | Path | None = None) -> dict:
 
 
 # ───────────────────────────── bundle ─────────────────────────────
+def _s(prop, kind, **kw):
+    return {"prop": prop, "kind": kind, **kw}
+
+
 def _title(ch: dict) -> str:
     t = label(ch["header"], 120)
     if ch["section"]:
@@ -39,80 +44,118 @@ def _title(ch: dict) -> str:
     return t
 
 
-def _s(prop, kind, **kw):
-    return {"prop": prop, "kind": kind, **kw}
+def resolve_subject(rec: dict, slug_: str | None = None) -> tuple[str, str]:
+    """Controlled subject (slug, label). Never derived from the model's free-text title."""
+    reg = subjects()
+    cands = [slug_, rec.get("subject")] + list((rec.get("query_interp") or {}).get("subjects", []))
+    for c in cands:
+        if c and c in reg:
+            return c, reg[c]["label"]
+    raise ValueError("Pick a regulated subject from the registry (Subjects panel) before exporting.")
 
 
-def build_bundle(rec: dict, subject_label: str) -> dict:
+def exportable(rec: dict, include_partial: bool = False) -> tuple[list[str], list[str]]:
+    """(task node ids that may be exported, human-readable reasons others were held back)."""
+    chunks = {c["code"] for c in rec["chunks"]}
+    rules = {r["code"] for r in rec["rules"]}
+    nodes, order, _, _ = normalize_graph(rec["graph"], chunks, rules, {d["id"] for d in rec["decisions"]})
+    ok_v = ("supported", "partial") if include_partial else ("supported",)
+    keep, held = [], []
+    for n in order:
+        nd = nodes[n]
+        if nd["type"] != "task":
+            continue
+        vs = [rec.get("verdicts", {}).get(c, {}).get("verdict") for c in nd["rules"]]
+        if not nd["rules"]:
+            held.append(f"'{nd['label'][:50]}': cites no extracted rule")
+        elif any(v is None for v in vs):
+            held.append(f"'{nd['label'][:50]}': not verified yet")
+        elif not all(v in ok_v for v in vs):
+            held.append(f"'{nd['label'][:50]}': verifier said {', '.join(sorted(set(vs) - set(ok_v)))}")
+        else:
+            keep.append(n)
+    return keep, held
+
+
+def build_bundle(rec: dict, subject_slug: str | None = None, include_partial: bool = False) -> dict:
     state, place = rec["state"], rec["place"]
     PL = f"{place.title()}, {state.upper()}"
+    subj_slug, subject_label = resolve_subject(rec, subject_slug)
     chunks = {c["code"]: c for c in rec["chunks"]}
-    steps_by_code = {s["code"]: s for s in rec.get("steps", [])}
-    nodes, order, edges, _ = normalize_graph(rec["graph"], set(chunks), set(steps_by_code))
-    tasks = [n for n in order if nodes[n]["type"] == "task"]
+    rules_by = {r["code"]: r for r in rec["rules"]}
+    nodes, order, edges, _ = normalize_graph(rec["graph"], set(chunks), set(rules_by), {d["id"] for d in rec["decisions"]})
+    tasks, held = exportable(rec, include_partial)
     pk = rec.get("pkey") or slug(f"{state}-{place}-{rec.get('query', '')}")
-    jur, subj = f"jur:{state}/{slug(place)}", f"subject:{slug(subject_label)}"
-    record_text = f"LOCUS-v1 + {rec.get('model', '?')} prompt {rec.get('prompt_ver', '?')}; review: {rec.get('status', '?')} {rec.get('note', '')}".strip()
-
+    jur, subj = f"jur:{state}/{slug(place)}", f"subject:{subj_slug}"
+    record_text = (f"LOCUS-v1 + open-us-law; extracted by {rec.get('model', '?')}, verified by {rec.get('verifier', '?')}, schema "
+                   f"{rec.get('schema_ver', '?')}; reviewed by {rec.get('reviewer', '?')}: {rec.get('note', '')}").strip()
     items: list[dict] = []
 
-    def item(key, lab, desc, stmts):
-        items.append({"key": key, "label": lab, "description": desc, "aliases": [f"lex-local:{key}"], "statements": stmts})
+    def item(key, lab, desc, stmts, **meta):
+        items.append({"key": key, "label": lab, "description": desc, "aliases": [f"lex-local:{key}"], "statements": stmts, **meta})
 
     item(subj, subject_label, "regulated subject", [_s("instance_of", "ext", key="class:subject", text="regulated subject")])
 
-    used_chunks: list[str] = []
+    used: list[str] = []
     for n in tasks:
         for c in nodes[n]["sources"]:
-            if c not in used_chunks:
-                used_chunks.append(c)
-    prov_key = {c: f"prov:{chunks[c]['key']}" for c in used_chunks}
-    for c in used_chunks:
+            if c not in used:
+                used.append(c)
+    prov_key = {c: f"prov:{chunks[c]['key']}" for c in used}
+    for c in used:
         ch = chunks[c]
-        st = [_s("instance_of", "ext", key="class:provision", text="ordinance provision"),
-              _s("jurisdiction", "ext", key=jur, text=PL),
-              _s("regulated_subject", "local", key=subj),
-              _s("citation", "string", value=f"{PL}, {'§ ' + ch['section'] + ' ' if ch['section'] else ''}{_title(ch)}"),
-              _s("source_chunk_id", "string", value=ch["key"])]
+        pl = PL if ch["level"] == "local" else ("United States" if ch["level"] == "federal" else state.upper())
+        jkey = jur if ch["level"] == "local" else f"jur:{'us' if ch['level'] == 'federal' else state}"
+        cite = ch["citation"] or f"{pl}, {'§ ' + ch['section'] + ' ' if ch['section'] else ''}{_title(ch)}"
+        st = [_s("instance_of", "ext", key="class:provision", text="ordinance provision" if ch["level"] == "local" else "statutory provision"),
+              _s("jurisdiction", "ext", key=jkey, text=pl), _s("regulated_subject", "local", key=subj),
+              _s("citation", "string", value=cite), _s("source_chunk_id", "string", value=ch["key"])]
         if ch["section"]:
             st.append(_s("legal_identifier", "string", value=ch["section"]))
-        item(prov_key[c], f"{PL} § {ch['section'] or label(ch['header'], 40)}", f"ordinance provision, {PL}", st)
+        item(prov_key[c], f"{pl} § {ch['section'] or label(ch['header'], 40)}", f"{ch['level']} provision, {pl}", st,
+             source_url=ch.get("source_url", ""))
 
     canon: dict[str, str] = {}
     for n in tasks:
-        a = nodes[n]["actor"]
-        if a:
-            canon.setdefault(a.lower(), a)
-    for low, a in canon.items():
+        if nodes[n]["actor"]:
+            canon.setdefault(nodes[n]["actor"].lower(), nodes[n]["actor"])
+    for a in canon.values():
         item(f"actor:{slug(a)}", a, "legal role", [_s("instance_of", "ext", key="class:legal-role", text="legal role")])
 
     norm_key = {n: f"norm:{pk}:{slug(n)}" for n in tasks}
     for n in tasks:
         nd = nodes[n]
-        f = node_facts(nd, steps_by_code)
-        st = [_s("instance_of", "ext", key="class:norm", text="legal norm"),
-              _s("jurisdiction", "ext", key=jur, text=PL),
+        f = node_facts(nd, rules_by)
+        st = [_s("instance_of", "ext", key="class:norm", text="legal norm"), _s("jurisdiction", "ext", key=jur, text=PL),
               _s("regulated_subject", "local", key=subj)]
         if f.get("modality"):
             st.append(_s("deontic_modality", "ext", key=f"modality:{f['modality']}", text=f["modality"]))
         if nd["actor"]:
             st.append(_s("bearer", "local", key=f"actor:{slug(canon[nd['actor'].lower()])}"))
-        if f.get("condition"):
-            st.append(_s("condition", "string", value=f["condition"]))
-        if f.get("penalty"):
-            st.append(_s("sanction", "string", value=f["penalty"]))
-        if f.get("fee_usd"):
-            st.append(_s("fee_amount", "quantity", amount=float(f["fee_usd"]), unit="unit:usd"))
+        cond = "; ".join(filter(None, [f.get("condition"), f.get("threshold") and f"threshold: {f['threshold']}",
+                                       f.get("deadline_fixed") and f"due {f['deadline_fixed']}",
+                                       f.get("amount_kind") == "percent_of_base" and f.get("amount_base") and f"rate applies to {f['amount_base']}"]))
+        if cond:
+            st.append(_s("condition", "string", value=cond))
+        if f.get("penalty_text"):
+            st.append(_s("sanction", "string", value=f["penalty_text"]))
+        try:
+            val = float(f["amount_value"]) if f.get("amount_value") else None
+        except ValueError:
+            val = None
+        if val is not None and f.get("amount_kind") == "flat_fee" and (f.get("amount_unit", "").lower() in ("", "usd", "$", "dollars")):
+            st.append(_s("fee_amount", "quantity", amount=val, unit="unit:usd"))
+        elif val is not None and f.get("amount_kind") == "percent_of_base":
+            st.append(_s("rate_percent", "quantity", amount=val, unit="unit:percent"))   # $0.36 per $100 == 0.36 %
         if f.get("deadline_days"):
             st.append(_s("time_limit", "quantity", amount=float(f["deadline_days"]), unit="unit:day"))
         if f.get("renewal"):
             st.append(_s("renewal_interval", "string", value=f["renewal"]))
-        if f.get("penalty_max_usd"):
-            st.append(_s("max_penalty_amount", "quantity", amount=float(f["penalty_max_usd"]), unit="unit:usd"))
+        if f.get("penalty_max_value") and f.get("penalty_unit", "").lower() in ("usd", "$", "dollars", ""):
+            st.append(_s("max_penalty_amount", "quantity", amount=float(f["penalty_max_value"]), unit="unit:usd"))
         st += [_s("based_on", "local", key=prov_key[c]) for c in nd["sources"]]
         item(norm_key[n], f"{nd['label']} ({PL})", f"step in {subject_label} process, {PL}", st)
 
-    # task -> next task, looking through gateways; the gateway question/answer becomes a qualifier
     out_edges: dict[str, list[dict]] = {}
     for e in edges:
         out_edges.setdefault(e["src"], []).append(e)
@@ -126,20 +169,20 @@ def build_bundle(rec: dict, subject_label: str) -> dict:
                 continue
             seen.add(v)
             if nodes[v]["type"] == "task":
-                q = [{"prop": "condition", "kind": "string", "value": " / ".join(path)}] if path else []
-                by_key[norm_key[t]]["statements"].append(_s("followed_by", "local", key=norm_key[v], qualifiers=q))
+                if v in norm_key:
+                    q = [{"prop": "condition", "kind": "string", "value": " / ".join(path)}] if path else []
+                    by_key[norm_key[t]]["statements"].append(_s("followed_by", "local", key=norm_key[v], qualifiers=q))
             elif nodes[v]["type"] == "gateway":
                 for e in out_edges.get(v, []):
                     stack.append((e["tgt"], path + [f"{nodes[v]['label']} → {e['label']}" if e["label"] else nodes[v]["label"]]))
 
-    proc = [_s("instance_of", "ext", key="class:process", text="legal process model"),
-            _s("jurisdiction", "ext", key=jur, text=PL),
-            _s("regulated_subject", "local", key=subj),
-            _s("extraction_record", "string", value=record_text)]
-    proc += [_s("based_on", "local", key=prov_key[c]) for c in used_chunks]
+    proc = [_s("instance_of", "ext", key="class:process", text="legal process model"), _s("jurisdiction", "ext", key=jur, text=PL),
+            _s("regulated_subject", "local", key=subj), _s("extraction_record", "string", value=record_text)]
+    proc += [_s("based_on", "local", key=prov_key[c]) for c in used]
     proc += [_s("has_part", "local", key=norm_key[n]) for n in tasks]
-    item(f"proc:{pk}", f"{rec['graph'].get('title') or subject_label} — {PL}", "legal process model (LLM-assisted, human-reviewed)", proc)
-    return {"jurisdiction": {"key": jur, "label": PL}, "subject": {"key": subj, "label": subject_label}, "items": items}
+    item(f"proc:{pk}", f"{subject_label} — {PL}", "legal process model (LLM-assisted, human-reviewed)", proc)
+    return {"jurisdiction": {"key": jur, "label": PL}, "subject": {"key": subj, "label": subject_label, "slug": subj_slug},
+            "items": items, "held_back": held}
 
 
 # ───────────────────────────── QuickStatements rendering ─────────────────────────────
@@ -235,14 +278,18 @@ def render_pass2(bundle: dict, qid_map: dict, props: dict):
     return "\n".join(lines) + ("\n" if lines else ""), rep
 
 
-def export_files(rec: dict, subject: str, qid_map: dict, props: dict, allow_draft: bool = False):
-    if rec.get("status") != "reviewed-ok" and not allow_draft:
-        raise PermissionError(f"Process status is '{rec.get('status')}'; mark it reviewed-ok first.")
-    bundle = build_bundle(rec, subject)
+def export_files(rec: dict, subject_slug: str | None, qid_map: dict, props: dict, allow_draft: bool = False,
+                 include_partial: bool = False):
+    if not allow_draft:
+        if rec.get("status") != "reviewed-ok":
+            raise PermissionError(f"Process status is '{rec.get('status')}'; mark it reviewed-ok first.")
+        if not (rec.get("reviewer") or "").strip() or not (rec.get("note") or "").strip():
+            raise PermissionError("reviewed-ok needs a reviewer name and a note saying what was checked.")
+    bundle = build_bundle(rec, subject_slug, include_partial)
     p1, r1 = render_pass1(bundle, qid_map, props)
     p2, r2 = render_pass2(bundle, qid_map, props)
     report = {"pass1": {k: sorted(v) if isinstance(v, set) else v for k, v in r1.items()},
-              "pass2": {k: sorted(v) for k, v in r2.items()}}
+              "pass2": {k: sorted(v) for k, v in r2.items()}, "held_back": bundle["held_back"]}
     return bundle, p1, p2, report
 
 
@@ -274,7 +321,8 @@ def main(argv=None) -> int:
     sub.add_parser("list", help="list stored processes")
     ex = sub.add_parser("export", help="write bundle.json, pass1.qs, pass2.qs, report.json")
     ex.add_argument("--pkey", required=True)
-    ex.add_argument("--subject", required=True)
+    ex.add_argument("--subject", help="subject slug from the registry (default: the process's own)")
+    ex.add_argument("--include-partial", action="store_true")
     ex.add_argument("--qid-map")
     ex.add_argument("--props")
     ex.add_argument("--out", default="out")
@@ -299,8 +347,8 @@ def main(argv=None) -> int:
         return 1
     qm = json.loads(Path(a.qid_map).read_text()) if a.qid_map else {}
     try:
-        bundle, p1, p2, report = export_files(rec, a.subject, qm, props, a.allow_draft)
-    except PermissionError as e:
+        bundle, p1, p2, report = export_files(rec, a.subject, qm, props, a.allow_draft, a.include_partial)
+    except (PermissionError, ValueError) as e:
         print(e, file=sys.stderr)
         return 2
     out = Path(a.out)
@@ -309,6 +357,8 @@ def main(argv=None) -> int:
     (out / "pass1.qs").write_text(p1)
     (out / "pass2.qs").write_text(p2)
     (out / "report.json").write_text(json.dumps(report, indent=2))
+    for h in bundle["held_back"]:
+        print(f"  [held back] {h}")
     print(f"{len(bundle['items'])} items · pass1 {p1.count(chr(10))} lines · pass2 {p2.count(chr(10))} lines")
     for k in ("unresolved", "warnings"):
         for v in report["pass1"][k]:

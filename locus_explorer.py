@@ -1,20 +1,21 @@
 """
-LOCUS explorer — Streamlit app for LocalLaws/LOCUS-v1 (Hugging Face)
+LOCUS explorer — local ordinances (LocalLaws/LOCUS-v1) + state/federal law (vaquill/open-us-law) -> marked-up,
+verified, reviewable process models.
 
     pip install -r requirements.txt
-    ollama pull qwen2.5:7b          # or any model; set in the sidebar
+    ollama pull qwen2.5:7b        # or use the Models panel in the sidebar to pull from here
     streamlit run locus_explorer.py
 
-Env: HF_TOKEN (gated datasets), LOCUS_SRC (parquet path/glob/hf:// glob), LOCUS_SLIM (text-free cache),
-     LOCUS_DB (SQLite for annotations + processes), OLLAMA_HOST, OLLAMA_MODEL.
-
-Tabs: National view / Jurisdiction / Provisions / Process builder / Compare (2-8 places).
-See README.md and docs/wikibase-mapping.md.
+Env: HF_TOKEN (open-us-law is gated: accept its conditions on the Hub first), LOCUS_SRC, LOCUS_SLIM, LOCUS_DB,
+     OLLAMA_HOST, OLLAMA_MODEL, OUL_TEMPLATE.
+Docs: README.md, docs/markup-schema.md, docs/wikibase-mapping.md
 """
 from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from pathlib import Path
 
 import duckdb
@@ -23,12 +24,16 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 
+import locus_core as C
 from locus_bpmn import emit_bpmn
-from locus_core import (DIM_LIST, DIMS, STATUSES, LLMUnavailable, annotate, clean, compile_process, default_host,
-                        default_model, get_annotations, get_matches, get_process, label, ollama_models,
-                        process_key, section_no, set_review, slug, summarize)
+from locus_core import DIM_LIST, DIMS, STATUSES, clean, default_host, default_model, label, sec_of, slug
+from locus_dmn import decision_xml
+from locus_llm import LLMUnavailable, model_available, model_selftest, pull_model, server_status, start_server
+from locus_markup import STAGES, Job, Progress, agreement, pipeline_status, process_key, run_jobs, run_pipeline
+from locus_sources import OUL_CORPORA, OUL_TEMPLATE, load_law_context, load_locus_place, locus_places, locus_states
 
 DEFAULT_SRC = os.environ.get("LOCUS_SRC", "hf://datasets/LocalLaws/LOCUS-v1/**/*.parquet")
+TEMPLATE = os.environ.get("OUL_TEMPLATE", OUL_TEMPLATE)
 SLIM_PATH = Path(os.environ.get("LOCUS_SLIM", "locus_slim.parquet"))
 SCORES_ARE = "z-scores (standard units) from the paper's ModernBERT regressors"
 
@@ -47,74 +52,65 @@ def _con() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     try:
         con.execute("INSTALL httpfs; LOAD httpfs;")
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     if tok:
         try:
             con.execute(f"CREATE OR REPLACE SECRET hf_tok (TYPE HUGGINGFACE, TOKEN {lit(tok)})")
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
     return con
 
 
+def cur():
+    return _con().cursor()
+
+
 def q(sql: str, params: list | None = None) -> pd.DataFrame:
-    return _con().cursor().execute(sql, params or []).df()
+    return cur().execute(sql, params or []).df()
 
 
-def run(sql: str) -> None:
-    _con().cursor().execute(sql)
-
-
-# ───────────────────────────── cached queries ─────────────────────────────
+# ───────────────────────────── cached data access ─────────────────────────────
 @st.cache_data(show_spinner="Aggregating by state…")
 def national_agg(source: str, sub_only: bool) -> pd.DataFrame:
     avg = ", ".join(f"avg({d}) AS {d}" for d in DIM_LIST)
     where = "WHERE is_substantive" if sub_only else ""
-    return q(
-        f"""SELECT state, source_jurisdiction_type AS jtype, count(*) AS n, {avg}
-            FROM {rel(source)} {where} GROUP BY 1, 2"""
-    )
+    return q(f"SELECT state, source_jurisdiction_type AS jtype, count(*) AS n, {avg} FROM {rel(source)} {where} GROUP BY 1, 2")
 
 
 @st.cache_data(show_spinner="Counting functions and topics…")
 def composition(source: str) -> pd.DataFrame:
-    return q(
-        f"""SELECT state, source_jurisdiction_type AS jtype, "function" AS fn,
-                   coalesce(topic, '(none)') AS topic, count(*) AS n
-            FROM {rel(source)} GROUP BY ALL"""
-    )
+    return q(f"""SELECT state, source_jurisdiction_type AS jtype, "function" AS fn, coalesce(topic, '(none)') AS topic, count(*) AS n
+                 FROM {rel(source)} GROUP BY ALL""")
 
 
 @st.cache_data
 def list_states(source: str) -> list[str]:
-    df = q(f"SELECT DISTINCT state FROM {rel(source)} WHERE state IS NOT NULL ORDER BY 1")
-    return df["state"].tolist()
+    return locus_states(cur(), source)
 
 
 @st.cache_data
 def list_places(source: str, state: str) -> pd.DataFrame:
-    return q(
-        f"""SELECT DISTINCT coalesce(city, county) AS place, source_jurisdiction_type AS jtype
-            FROM {rel(source)} WHERE state = ? AND coalesce(city, county) IS NOT NULL
-            ORDER BY 1""",
-        [state],
-    )
+    return locus_places(cur(), source, state)
 
 
 @st.cache_data(show_spinner="Reading provisions…")
 def load_place(source: str, state: str, place: str) -> pd.DataFrame:
-    dims = ", ".join(DIM_LIST)
-    df = q(
-        f"""SELECT header, content, is_substantive, "function" AS fn, topic,
-                   source_jurisdiction_type AS jtype, state, city, county, {dims}
-            FROM {rel(source)} WHERE state = ? AND coalesce(city, county) = ?""",
-        [state, place],
-    )
-    return df.reset_index(drop=True)
+    return load_locus_place(cur(), source, state, place)
 
 
-# ───────────────────────────── viewer + panels ─────────────────────────────
+@st.cache_data(show_spinner="Searching state/federal law…")
+def load_law(template: str, jur: str, corpora: tuple, terms: tuple, cap: int, pinned: tuple):
+    return load_law_context(cur(), template, jur, list(corpora), list(terms), cap, list(pinned))
+
+
+@st.cache_data(ttl=4, show_spinner=False)
+def cached_status(host: str) -> dict:
+    return server_status(host)
+
+
+# ───────────────────────────── viewer ─────────────────────────────
 def bpmn_viewer(xml: str, height: int = 560) -> None:
     safe = json.dumps(xml).replace("</", "<\\/")
     html = f"""
@@ -130,31 +126,234 @@ def bpmn_viewer(xml: str, height: int = 560) -> None:
     .then(() => viewer.get('canvas').zoom('fit-viewport'))
     .catch(e => {{ document.getElementById('err').textContent = 'BPMN render error: ' + e.message; }});
 </script>"""
-    if hasattr(st, "iframe"):  # newer Streamlit; components.html is being retired
+    if hasattr(st, "iframe"):
         st.iframe(html, height=height + 40)
     else:
         components.html(html, height=height + 40)
 
 
-def wikibase_export_ui(rec: dict, kp: str) -> None:
-    from lexipedia_export import export_files, load_props
+# ───────────────────────────── model server panel (sidebar) ─────────────────────────────
+def models_panel() -> dict:
+    st.header("Models")
+    host = st.text_input("Ollama host", default_host())
+    status = cached_status(host)
+    if not status["up"]:
+        st.error(f"Ollama is not reachable at {host}: {status['error']}")
+        c1, c2 = st.columns(2)
+        if c1.button("Start Ollama here", help="Runs `ollama serve` on this machine (needs the ollama binary on PATH)"):
+            ok, msg = start_server(host)
+            (st.success if ok else st.error)(msg)
+            cached_status.clear()
+            if ok:
+                st.rerun()
+        c2.link_button("Install Ollama", "https://ollama.com/download")
+        st.caption("Stored results stay viewable without a model; running new stages needs one.")
+    else:
+        st.success(f"Ollama is up · {len(status['models'])} model(s) installed")
+        with st.expander("Installed models"):
+            st.dataframe(pd.DataFrame([{"model": m["name"], "GB": round(m["size"] / 1e9, 1)} for m in status["models"]]))
+
+    model_a = st.text_input("Model A", default_model(), key="model_a").strip()
+    model_b = st.text_input("Model B (optional — runs at the same time as A)", "", key="model_b").strip()
+    verifier = st.text_input("Verifier (optional)", "", key="verifier",
+                             help="Checks every cited rule against its source. A different model than the extractor catches more.").strip()
+    wanted = [m for m in dict.fromkeys([model_a, model_b, verifier]) if m]
+    for i, m in enumerate(wanted):
+        have = model_available(status, m) if status["up"] else None
+        c1, c2 = st.columns([3, 2])
+        c1.markdown(f"`{m}` — " + ("✅ installed" if have else "⬇ not installed" if have is False else "❔ server down"))
+        if status["up"] and not have and c2.button("Pull", key=f"pull{i}"):
+            bar, msg = st.progress(0.0), st.empty()
+            try:
+                for d in pull_model(host, m):
+                    tot = d.get("total") or 0
+                    bar.progress(min(1.0, (d.get("completed") or 0) / tot) if tot else 0.0)
+                    msg.caption(d.get("status", ""))
+                cached_status.clear()
+                st.rerun()
+            except LLMUnavailable as e:
+                st.error(str(e))
+        elif status["up"] and have and c2.button("Self-test", key=f"test{i}", help="Tiny schema-following check"):
+            r = model_selftest(host, m)
+            (st.success if r["ok"] else st.error)(f"{m}: {'OK' if r['ok'] else r['error']} ({r['seconds']}s)")
+    models = [m for m in dict.fromkeys([model_a, model_b]) if m]
+    parallel = st.checkbox("Run models at the same time", True,
+                           help="One worker thread per model. Both models must fit in memory or Ollama will swap them (OLLAMA_MAX_LOADED_MODELS).")
+    workers = int(st.number_input("Requests in flight per model", 1, 4, 1,
+                                  help="Raise only if Ollama is started with OLLAMA_NUM_PARALLEL > 1."))
+    return {"host": host, "models": models, "verifier": verifier, "parallel": parallel, "workers": workers, "status": status}
+
+
+# ───────────────────────────── running jobs with live progress ─────────────────────────────
+def run_with_progress(jobs: list[Job], parallel: bool) -> dict:
+    prog = Progress()
+    res: dict = {}
+    t = threading.Thread(target=lambda: res.update(run_jobs(jobs, prog, parallel)), daemon=True)
+    t.start()
+    bar, box = st.progress(0.0, text="Starting…"), st.empty()
+    while t.is_alive():
+        snap = prog.snapshot()
+        frac, lines = 0.0, []
+        for j in jobs:
+            s = snap.get(j.pid, {})
+            stage, done, total = s.get("stage", "queued"), s.get("done", 0), s.get("total", 0)
+            idx = STAGES.index(stage) if stage in STAGES else (len(STAGES) if stage == "done" else 0)
+            frac += (idx + (done / total if total else 0)) / len(STAGES)
+            lines.append(f"- **{j.pid}** — {stage}" + (f" {done}/{total}" if total else ""))
+        bar.progress(min(1.0, frac / max(1, len(jobs))), text="Working…")
+        box.markdown("\n".join(lines))
+        time.sleep(0.35)
+    t.join()
+    bar.empty()
+    box.empty()
+    st.session_state["run_log"] = {k: v["errors"] for k, v in res.items() if v["errors"]}
+    return res
+
+
+def show_run_log() -> None:
+    log = st.session_state.get("run_log")
+    if log:
+        with st.expander("Messages from the last run", expanded=True):
+            for k, errs in log.items():
+                for e in errs:
+                    st.warning(f"{k}: {e}")
+
+
+# ───────────────────────────── candidates + cells ─────────────────────────────
+def gather(src, state, place, query, cfg) -> tuple[pd.DataFrame, list[str]]:
+    local = load_place(src, state, place) if place else pd.DataFrame()
+    frames = {"local": local}
+    problems: list[str] = []
+    terms = tuple(t for t in query.lower().split() if t)
+    pinned = tuple(p.strip() for p in cfg["pinned"].split(",") if p.strip())
+    if cfg["state_law"] and terms:
+        frames["state"], pr = load_law(cfg["template"], state, tuple(cfg["corpora"]), terms, cfg["cap_state"], pinned)
+        problems += pr
+    if cfg["federal_law"] and terms:
+        frames["federal"], pr = load_law(cfg["template"], cfg["fed_code"], tuple(cfg["corpora"]), terms, cfg["cap_fed"], ())
+        problems += pr
+    caps = {"local": cfg["cap_local"], "state": cfg["cap_state"], "federal": cfg["cap_fed"]}
+    fns = ["Rules", "Process", "Enforcement"] + (["Context"] if cfg["ctx"] else [])
+    return C.build_candidates(frames, query, caps, fns), problems
+
+
+def make_job(m, state, place, query, model, mcfg) -> Job:
+    return Job(state=state, place=place, query=query, chunks=m, model=model, host=mcfg["host"],
+               verifier=mcfg["verifier"], workers=mcfg["workers"])
+
+
+def stage_line(stt: dict) -> str:
+    tick = lambda ok: "✓" if ok else "·"
+    return (f"triage {stt['triage']}/{stt['chunks']} · relevance {stt['relevance']}/{stt['chunks']} "
+            f"({stt['relevant']} relevant) · extract {stt['extract']}/{stt['relevant']} · regime {tick(stt['regime'])} · "
+            f"compile {tick(stt['process'])} · verified {stt['verified']}")
+
+
+def section_table(job: Job, stt: dict) -> pd.DataFrame:
+    rows = []
+    for _, r in job.chunks.iterrows():
+        k = r["ckey"]
+        t, rl, ex = stt["triage_data"].get(k, {}), stt["relevance_data"].get(k, {}), stt["extract_data"].get(k, {})
+        rows.append({"code": r["code"], "level": r["level"], "§": sec_of(r), "title": label(r["header"], 50),
+                     "role": t.get("role", ""), "audience": t.get("audience", ""), "relevant": rl.get("verdict", ""),
+                     "why": rl.get("reason", ""), "subjects": ", ".join(t.get("subjects", [])),
+                     "extracted": str(len(ex.get("rules", [])) + len(ex.get("rows", []))) if ex else ""})
+    return pd.DataFrame(rows)
+
+
+def cell(job: Job, kp: str, color_dim: str | None, height: int = 520) -> None:
+    stt = pipeline_status(job)
+    st.caption(stage_line(stt))
+    c1, c2, c3 = st.columns([2, 2, 2])
+    if c1.button("Run pipeline (resumes)", key=kp + "run"):
+        run_with_progress([job], False)
+        st.rerun()
+    if c2.button("Re-verify", key=kp + "ver", disabled=not stt["process"], help="Run the verifier again on every cited rule"):
+        run_pipeline(job, Progress(), ["verify"], force_verify=True)
+        st.rerun()
+    if c3.button("Re-compile", key=kp + "rec", disabled=not stt["process"],
+                 help="Rebuild the graph from the stored markup (keeps your review status; clears verdicts, then re-verifies)"):
+        run_pipeline(job, Progress(), ["compile", "verify"], force_compile=True)
+        st.rerun()
+    with st.expander("Sections: what the pipeline decided about each", expanded=not stt["process"]):
+        st.dataframe(section_table(job, stt))
+        for _, r in job.chunks.iterrows():
+            t = stt["triage_data"].get(r["ckey"])
+            if t and t.get("summary"):
+                st.markdown(f"**{r['code']} §{sec_of(r) or '?'}** · {t['role']} — {t['summary']}")
+            with st.popover(f"{r['code']} text"):
+                st.markdown(clean(r["content"])[:4000])
+    rec = C.get_process(stt["pkey"])
+    if not rec:
+        return
+    reg = rec["regime"]
+    with st.expander("Regime outline (phases, excluded, missing)"):
+        st.write({p["phase"]: p["codes"] for p in reg["phases"]})
+        for x in reg.get("excluded", []):
+            st.markdown(f"- excluded **{x['code']}** — {x['reason']}")
+        for x in reg.get("missing", []):
+            st.markdown(f"- **not found in the sources:** {x['item']} — {x['why']}")
+    xml, meta, warns = emit_bpmn(rec, job.state, job.place, job.query, color_dim)
+    if xml is None:
+        st.warning(" ".join(warns))
+        return
+    bpmn_viewer(xml, height)
+    st.caption("Lanes = who acts. Grey = no source cited · red = verifier says the text does not state it · amber outline = partly "
+               "supported. " + (f"Fill = mean {color_dim.replace('_', ' ')} of the cited provisions." if color_dim else ""))
+    for w in warns:
+        st.warning(w)
+    r1, r2, r3 = st.columns([1, 1, 2])
+    status = r1.selectbox("Review status", STATUSES, index=STATUSES.index(rec["status"]), key=kp + "st")
+    reviewer = r2.text_input("Reviewer", rec.get("reviewer", ""), key=kp + "rv")
+    note = r3.text_input("What was checked", rec["note"], key=kp + "nt")
+    if (status, reviewer, note) != (rec["status"], rec.get("reviewer", ""), rec["note"]) and st.button("Save review", key=kp + "sv"):
+        C.set_review(stt["pkey"], status, note, reviewer)
+        st.rerun()
+    fname = f"{job.state}-{slug(job.place)}-{slug(job.query)}-{slug(job.model)}"
+    d = st.columns(4)
+    d[0].download_button("BPMN", xml, f"{fname}.bpmn", "application/xml", key=kp + "dx")
+    d[1].download_button("Sidecar JSON", json.dumps({"pkey": stt["pkey"], "status": rec["status"], "elements": meta}, indent=2),
+                         f"{fname}.json", "application/json", key=kp + "dj")
+    d[2].download_button("Debug bundle", json.dumps(C.export_debug(stt["pkey"]), indent=2, default=str), f"{fname}-debug.json",
+                         "application/json", key=kp + "dd",
+                         help="Every stage output + every prompt/response. Send this back when something looks wrong.")
+    for dec in rec["decisions"]:
+        d[3].download_button(f"DMN {dec['id']}", decision_xml(dec, job.place, job.state), f"{fname}-{dec['id']}.dmn",
+                             "application/xml", key=kp + "dm" + dec["id"], help=f"Decision table: {dec['name']}")
+    with st.expander("Elements and sources"):
+        st.dataframe(pd.DataFrame(meta).astype(str))
+    export_ui(rec, kp)
+
+
+def export_ui(rec: dict, kp: str) -> None:
+    from lexipedia_export import export_files, exportable, load_props, resolve_subject
 
     with st.expander("Wikibase export (dry run — writes nothing)"):
-        if rec["status"] != "reviewed-ok":
-            st.info("Set the review status to **reviewed-ok** and save. Draft LLM output is not exported.")
+        if rec["status"] != "reviewed-ok" or not rec.get("reviewer") or not rec.get("note"):
+            st.info("Set status **reviewed-ok** with a reviewer and a note, then save. Draft LLM output is never exported.")
             return
-        props = load_props()
-        subject = st.text_input("Subject label (shared across places — this is what makes them comparable)",
-                                rec["graph"].get("title") or rec["query"], key=kp + "subj")
-        raw = st.text_area("qid_map.json — local key → QID for items that already exist (classes, units, "
-                           "jurisdictions, and pass-1 results when running pass 2)", "{}", key=kp + "qm", height=90)
+        reg = C.subjects(include_proposed=False)
+        try:
+            default = resolve_subject(rec)[0]
+        except ValueError:
+            default = next(iter(reg))
+        subject = st.selectbox("Regulated subject (controlled vocabulary)", list(reg),
+                               index=list(reg).index(default) if default in reg else 0,
+                               format_func=lambda s: f"{reg[s]['label']} ({s})", key=kp + "subj")
+        partial = st.checkbox("Also export partially-supported steps", False, key=kp + "part")
+        raw = st.text_area("qid_map.json — local key → QID (classes, units, modalities, jurisdictions; later also pass-1 results)",
+                           "{}", key=kp + "qm", height=90)
         try:
             qm = json.loads(raw or "{}")
         except json.JSONDecodeError as e:
             st.error(f"qid_map is not valid JSON: {e}")
             return
-        bundle, p1, p2, report = export_files(rec, subject, qm, props)
-        st.caption(f"{len(bundle['items'])} items in bundle · pass 1: {p1.count(chr(10))} lines · pass 2: {p2.count(chr(10))} lines")
+        bundle, p1, p2, report = export_files(rec, subject, qm, load_props(), include_partial=partial)
+        keep, held = exportable(rec, partial)
+        st.caption(f"{len(bundle['items'])} items · {len(keep)} step(s) exported · pass 1: {p1.count(chr(10))} lines · "
+                   f"pass 2: {p2.count(chr(10))} lines")
+        for h in held:
+            st.warning(f"Held back — {h}")
         for k in report["pass1"]["unresolved"]:
             st.warning(f"Needs a QID in qid_map: `{k}`")
         for w in report["pass1"]["warnings"]:
@@ -163,115 +362,60 @@ def wikibase_export_ui(rec: dict, kp: str) -> None:
         c[0].download_button("bundle.json", json.dumps(bundle, indent=2), f"{kp}bundle.json", "application/json", key=kp + "eb")
         c[1].download_button("pass1.qs", p1, f"{kp}pass1.qs", "text/plain", key=kp + "e1")
         c[2].download_button("pass2.qs", p2, f"{kp}pass2.qs", "text/plain", key=kp + "e2")
-        with st.popover("Preview pass 1"):
-            st.code(p1 or "(empty — resolve the QIDs above first)", language="text")
-
-
-def process_panel(m: pd.DataFrame, state: str, place: str, query: str, kp: str,
-                  model: str, host: str, color_dim: str | None, height: int = 520) -> None:
-    if m.empty:
-        st.info("No matching provisions. Try fewer or shorter words (stems work: 'licen').")
-        return
-    anns = get_annotations(m["ckey"].tolist(), model)
-    missing = m[~m["ckey"].isin(anns)]
-    st.caption(f"{len(m)} provisions · {len(anns)} annotated by `{model}`")
-
-    b1, b2 = st.columns(2)
-    if b1.button(f"1 · Annotate {len(missing)} provision(s)", key=kp + "ann", disabled=missing.empty):
-        bar = st.progress(0.0, text="Calling Ollama…")
-        errs = annotate(missing, model, host, bar)
-        bar.empty()
-        for e in errs:
-            st.error(e)
-        if not errs:
-            st.rerun()
-    pkey = process_key(state, place, query, model, m["ckey"].tolist())
-    rec = get_process(pkey)
-    if b2.button("2 · Compile process" + (" (redo)" if rec else ""), key=kp + "cmp", disabled=not anns):
-        try:
-            with st.spinner("Compiling…"):
-                compile_process(m, anns, state, place, query, model, host)
-            st.rerun()
-        except Exception as e:  # noqa: BLE001
-            st.error(str(e))
-
-    with st.expander("What these provisions say (plain English)", expanded=rec is None):
-        for r in m.itertuples():
-            a = anns.get(r.ckey)
-            st.markdown(f"**§{section_no(r.header) or '?'} {label(r.header, 70)}** · {r.fn} · {r.topic or '—'}")
-            st.write(a["summary"] if a and a["summary"] else clean(r.content)[:240] + "…")
-            with st.popover("full text"):
-                st.markdown(r.content)
-
-    if rec:
-        xml, meta, warns = emit_bpmn(rec, state, place, query, color_dim)
-        if xml is None:
-            st.warning(" ".join(warns))
-            return
-        bpmn_viewer(xml, height)
-        st.caption("Lanes = who acts. Grey task = no source provision cited (unverified). "
-                   + (f"Fill = mean {color_dim.replace('_', ' ')} of the cited provisions." if color_dim else ""))
-        for w in warns:
-            st.warning(w)
-        r1, r2 = st.columns([1, 2])
-        status = r1.selectbox("Review status", STATUSES, index=STATUSES.index(rec["status"]), key=kp + "st")
-        note = r2.text_input("Reviewer note", rec["note"], key=kp + "nt")
-        if (status, note) != (rec["status"], rec["note"]) and st.button("Save review", key=kp + "sv"):
-            set_review(pkey, status, note)
-            st.rerun()
-        fname = f"{state}-{slug(place)}-{slug(query)}"
-        d1, d2 = st.columns(2)
-        d1.download_button("Download .bpmn", xml, f"{fname}.bpmn", "application/xml", key=kp + "dx")
-        d2.download_button("Download sidecar .json", json.dumps({"pkey": pkey, "status": rec["status"], "elements": meta}, indent=2),
-                           f"{fname}.json", "application/json", key=kp + "dj")
-        with st.expander("Elements and sources"):
-            st.dataframe(pd.DataFrame(meta).astype(str))
-        wikibase_export_ui(rec, kp)
 
 
 def grid_cols(n: int, per_row: int) -> list:
-    """n column containers laid out in rows of at most per_row."""
     out = []
     for start in range(0, n, per_row):
         out += st.columns(min(per_row, n - start))
     return out
 
 
-# ───────────────────────────── UI ─────────────────────────────
+def sources_panel() -> dict:
+    st.header("Data")
+    src = st.text_input("LOCUS parquet (local ordinances)", DEFAULT_SRC, help="Local path, glob, or hf:// glob")
+    agg_src = str(SLIM_PATH) if SLIM_PATH.exists() else src
+    st.caption(f"National views read: `{agg_src}`")
+    if st.button("Build slim cache (no text, fast national views)"):
+        cols = ", ".join(["state", "city", "county", "source_jurisdiction_type", '"function"', "topic", "is_substantive", *DIM_LIST])
+        with st.spinner("Streaming columns from source — one-time, can take a while…"):
+            cur().execute(f"COPY (SELECT {cols} FROM {rel(src)}) TO {lit(str(SLIM_PATH))} (FORMAT PARQUET, COMPRESSION ZSTD)")
+        st.cache_data.clear()
+        st.rerun()
+    sub_only = st.checkbox("National view: substantive chunks only", value=True)
+    with st.expander("State / federal law (open-us-law)"):
+        has_tok = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"))
+        st.caption(("✅ HF_TOKEN is set. " if has_tok else "⚠ HF_TOKEN not set — the dataset is gated: accept its conditions on the "
+                    "Hub, then export HF_TOKEN. ") + "Files are named `us_{jurisdiction}_{corpus}.parquet`.")
+        state_law = st.checkbox("Include state law for the selected state", True)
+        federal_law = st.checkbox("Include federal law", False)
+        template = st.text_input("File template", TEMPLATE)
+        corpora = st.multiselect("Corpora", OUL_CORPORA, default=["statutes"])
+        fed_code = st.text_input("Federal jurisdiction code in file names", "us", help="Check the dataset's Files tab: us, federal, …")
+        pinned = st.text_input("Always include citations containing", "", help="Comma-separated, e.g. 58.1-3703")
+    c1, c2, c3 = st.columns(3)
+    cap_local = int(c1.number_input("Local max", 1, 60, 15))
+    cap_state = int(c2.number_input("State max", 0, 30, 6))
+    cap_fed = int(c3.number_input("Fed max", 0, 20, 0))
+    return {"src": src, "agg_src": agg_src, "sub_only": sub_only, "state_law": state_law, "federal_law": federal_law,
+            "template": template, "corpora": corpora or ["statutes"], "fed_code": fed_code, "pinned": pinned,
+            "cap_local": cap_local, "cap_state": cap_state, "cap_fed": cap_fed, "ctx": False}
+
+
+# ───────────────────────────── main ─────────────────────────────
 def main() -> None:
     st.set_page_config(page_title="LOCUS explorer", layout="wide")
     st.title("LOCUS explorer")
-    st.caption("Local Ordinance Corpus for the United States (Peskoff et al., arXiv 2606.19334) · "
+    st.caption("Local ordinances (LOCUS-v1) + state/federal law (open-us-law) → marked-up, verified, reviewable process models · "
                "dimension scores are " + SCORES_ARE)
 
     with st.sidebar:
-        st.header("Data")
-        src = st.text_input("Parquet source", DEFAULT_SRC, help="Local path, glob, or hf:// glob")
-        agg_src = str(SLIM_PATH) if SLIM_PATH.exists() else src
-        st.caption(f"National views read: `{agg_src}`")
-        if st.button("Build slim cache (no text, fast national views)"):
-            cols = ", ".join(["state", "city", "county", "source_jurisdiction_type", '"function"',
-                              "topic", "is_substantive", *DIM_LIST])
-            with st.spinner("Streaming columns from source — one-time, can take a while…"):
-                run(f"COPY (SELECT {cols} FROM {rel(src)}) TO {lit(str(SLIM_PATH))} (FORMAT PARQUET, COMPRESSION ZSTD)")
-            st.cache_data.clear()
-            st.rerun()
-        sub_only = st.checkbox("Substantive chunks only (Rules + Enforcement)", value=True)
-
-        st.header("Ollama")
-        host = st.text_input("Host", default_host())
-        model = st.text_input("Model", default_model())
-        if st.button("Test connection"):
-            try:
-                names = ollama_models(host)
-                st.success(f"Up. Models: {', '.join(names) or 'none pulled'}")
-                if model not in names:
-                    st.warning(f"`{model}` not found — run `ollama pull {model}`")
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Not reachable: {e}")
+        cfg = sources_panel()
+        mcfg = models_panel()
         color_choice = st.selectbox("Colour process boxes by", ["(none)", *DIM_LIST])
         color_dim = None if color_choice == "(none)" else color_choice
 
+    src, agg_src = cfg["src"], cfg["agg_src"]
     try:
         states = list_states(agg_src)
     except Exception as e:  # noqa: BLE001
@@ -279,12 +423,11 @@ def main() -> None:
         st.info("Check the path/glob, set HF_TOKEN if the dataset is gated, or point LOCUS_SRC at a local parquet.")
         st.stop()
 
-    t_nat, t_jur, t_prov, t_proc, t_cmp = st.tabs(
-        ["National view", "Jurisdiction", "Provisions", "Process builder", "Compare"])
+    t_nat, t_jur, t_prov, t_proc, t_cmp, t_lib = st.tabs(
+        ["National view", "Jurisdiction", "Provisions", "Process builder", "Compare", "Library"])
 
-    # ── 1. National ──
     with t_nat:
-        agg = national_agg(agg_src, sub_only)
+        agg = national_agg(agg_src, cfg["sub_only"])
         g = agg.copy()
         for d in DIM_LIST:
             g[d] = g[d] * g["n"]
@@ -292,64 +435,51 @@ def main() -> None:
         for d in DIM_LIST:
             sm[d] = sm[d] / sm["n"]
         sm = sm.reset_index()
-
         dim = st.selectbox("Dimension", DIM_LIST, format_func=lambda d: DIMS[d])
         c1, c2 = st.columns([3, 2])
         with c1:
-            fig = px.choropleth(sm, locations=sm["state"].str.upper(), locationmode="USA-states", color=dim,
-                                scope="usa", color_continuous_scale="RdBu_r", color_continuous_midpoint=0,
-                                hover_data={"n": True}, labels={dim: "mean z"})
+            fig = px.choropleth(sm, locations=sm["state"].str.upper(), locationmode="USA-states", color=dim, scope="usa",
+                                color_continuous_scale="RdBu_r", color_continuous_midpoint=0, hover_data={"n": True}, labels={dim: "mean z"})
             fig.update_layout(margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig)
         with c2:
             by_type = agg.assign(w=agg[dim] * agg["n"]).groupby("jtype")[["w", "n"]].sum()
             by_type["mean z"] = by_type["w"] / by_type["n"]
             st.plotly_chart(px.bar(by_type.reset_index(), x="jtype", y="mean z", title="Cities vs counties"))
-            top = sm.sort_values(dim, ascending=False).head(10)
-            st.plotly_chart(px.bar(top, x=dim, y="state", orientation="h", title="Top 10 states"))
-
+            st.plotly_chart(px.bar(sm.sort_values(dim, ascending=False).head(10), x=dim, y="state", orientation="h", title="Top 10 states"))
         st.subheader("What each kind of jurisdiction regulates")
         comp = composition(agg_src)
-        comp = comp[comp["fn"].isin(["Rules", "Enforcement"])] if sub_only else comp
+        comp = comp[comp["fn"].isin(["Rules", "Enforcement"])] if cfg["sub_only"] else comp
         share = comp.groupby(["jtype", "topic"])["n"].sum().reset_index()
         share["share"] = share["n"] / share.groupby("jtype")["n"].transform("sum")
         st.plotly_chart(px.bar(share, x="jtype", y="share", color="topic", barmode="stack"))
-        st.caption("Paper §6: county codes skew toward zoning, city codes toward nuisance/public order.")
 
-    # ── pick a place (tabs 2-4) ──
     with st.sidebar:
         st.header("Jurisdiction")
         state = st.selectbox("State", states, index=states.index("va") if "va" in states else 0)
         plist = list_places(agg_src, state)["place"].tolist()
-        place = st.selectbox("City / county", plist,
-                             index=plist.index("charlottesville") if "charlottesville" in plist else 0)
+        place = st.selectbox("City / county", plist, index=plist.index("charlottesville") if "charlottesville" in plist else 0)
     df = load_place(src, state, place) if place else pd.DataFrame()
 
-    # ── 2. Jurisdiction ──
     with t_jur:
         if df.empty:
             st.warning("No rows for that jurisdiction.")
         else:
             m4 = st.columns(4)
             m4[0].metric("Chunks", f"{len(df):,}")
-            m4[1].metric("Substantive", f"{df['is_substantive'].mean():.0%}")
+            m4[1].metric("Substantive", f"{df['is_substantive'].astype(float).mean():.0%}")
             m4[2].metric("Type", ", ".join(sorted(df["jtype"].dropna().unique())))
             m4[3].metric("Mean opacity (z)", f"{df['opacity'].mean():+.2f}")
             a, b = st.columns(2)
             a.plotly_chart(px.histogram(df, x="fn", color="fn", title="Function"))
-            b.plotly_chart(px.histogram(df[df["is_substantive"]], x="topic", color="topic", title="Topic (substantive only)"))
+            b.plotly_chart(px.histogram(df[df["is_substantive"].astype(bool)], x="topic", color="topic", title="Topic (substantive only)"))
             dsel = st.selectbox("Dimension by topic", DIM_LIST, format_func=lambda d: DIMS[d], key="jd")
             st.plotly_chart(px.box(df, x="topic", y=dsel, color="fn", points="outliers"))
             st.plotly_chart(px.scatter(df, x="opacity", y="paternalism", color="topic", hover_name="header", opacity=0.6,
-                                       title="Opacity vs paternalism (paper: weakly correlated, r≈0.11 nationally)"))
-            strip = df.reset_index().rename(columns={"index": "position"})
-            st.plotly_chart(px.scatter(strip, x="position", y="topic", color="fn", hover_name="header",
-                                       title="Topic by position in file"))
-            st.caption("Assumes file row order = code order. Verify before relying on this view.")
+                                       title="Opacity vs paternalism"))
             st.subheader("Hardest to read (highest opacity)")
             st.dataframe(df.sort_values("opacity", ascending=False)[["header", "fn", "topic", "opacity", "enforcement_discretion"]].head(15))
 
-    # ── 3. Provisions ──
     with t_prov:
         if not df.empty:
             f1, f2, f3, f4 = st.columns([3, 2, 2, 1])
@@ -372,32 +502,47 @@ def main() -> None:
                 st.markdown(f"**{label(r['header'], 200)}**")
                 st.markdown(r["content"])
 
-    # ── 4. Process builder (one jurisdiction) ──
+    models = mcfg["models"] or [default_model()]
+
+    # ── Process builder (one place, 1-2 models) ──
     with t_proc:
         st.markdown(
-            "**Annotate → compile → review.** Ollama reads each matching section and extracts actor, action, "
-            "condition, deadline, fee, penalty and typed values (stored in SQLite). A second pass assembles those "
-            "steps into one process with lanes per actor. Every box cites its source sections; boxes without a "
-            "source are grey. The model's output is a draft for a lawyer to check, not a legal reading.")
-        c1, c2, c3 = st.columns([3, 1, 1])
-        pq = c1.text_input("Topic (all words must appear; stems work)", "dog licen", key="pb_q")
-        pcap = c2.number_input("Max sections", 3, 40, 15, key="pb_cap")
-        pctx = c3.checkbox("Include Context", False, key="pb_ctx")
-        pf = ["Rules", "Process", "Enforcement"] + (["Context"] if pctx else [])
-        pm = get_matches(df, pq, pf, int(pcap)) if not df.empty else df
-        process_panel(pm, state, place, pq, "pb_", model, host, color_dim)
+            "**Markup → relevance → extract → outline → compile → verify.** Each pass is stored, so re-runs are free and "
+            "two models never overwrite each other. Nothing here is a legal reading; it is a draft for a lawyer to check.")
+        show_run_log()
+        c1, c2 = st.columns([4, 1])
+        pq = c1.text_input("Topic (all words must appear; stems work)", "business licen", key="pb_q")
+        cfg["ctx"] = c2.checkbox("Include Context", False, key="pb_ctx")
+        m, problems = gather(src, state, place, pq, cfg)
+        for p in problems:
+            st.warning(f"open-us-law: {p}")
+        if m.empty:
+            st.info("No matching sections. Try fewer or shorter words.")
+        else:
+            st.caption(f"{len(m)} candidate sections: " + " / ".join(f"{int((m['level'] == lv).sum())} {lv}" for lv in ("local", "state", "federal")))
+            jobs = [make_job(m, state, place, pq, mod, mcfg) for mod in models]
+            if len(jobs) > 1 and st.button("Run all models now", key="pb_all"):
+                run_with_progress(jobs, mcfg["parallel"])
+                st.rerun()
+            for i, (col, job) in enumerate(zip(grid_cols(len(jobs), 2), jobs)):
+                with col:
+                    st.markdown(f"#### {job.model}")
+                    cell(job, f"pb{i}_", color_dim)
+            if len(jobs) == 2:
+                ag = agreement(C.get_process(process_key(jobs[0])), C.get_process(process_key(jobs[1])))
+                if ag:
+                    st.subheader("Do the two models agree?")
+                    st.json(ag)
 
-    # ── 5. Compare ──
+    # ── Compare: places × models ──
     with t_cmp:
-        st.markdown("Same topic, several jurisdictions, side by side.")
-        c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
+        st.markdown("Same topic, several places, and (optionally) two models at once.")
+        show_run_log()
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
         cq = c1.text_input("Topic (all words must appear; stems work)", "dog licen", key="cmp_q")
-        ccap = c2.number_input("Max sections each", 3, 40, 15, key="cmp_cap")
-        cctx = c3.checkbox("Include Context", False, key="cmp_ctx")
-        n = int(c4.number_input("Places to compare", 2, 8, 2, key="cmp_n"))
-        per_row = int(c5.number_input("Columns per row", 1, 4, 3, key="cmp_cols"))
-        cf = ["Rules", "Process", "Enforcement"] + (["Context"] if cctx else [])
-
+        cfg["ctx"] = c2.checkbox("Include Context", False, key="cmp_ctx")
+        n = int(c3.number_input("Places to compare", 2, 8, 2, key="cmp_n"))
+        per_row = int(c4.number_input("Columns per row", 1, 4, 3, key="cmp_cols"))
         picks: list[tuple[str, str]] = []
         for i, col in enumerate(grid_cols(n, per_row)):
             with col:
@@ -408,26 +553,74 @@ def main() -> None:
                 idx = pl.index(prefer) if prefer in pl else min(i, max(len(pl) - 1, 0))
                 picks.append((s, st.selectbox("City / county", pl, index=idx, key=f"cp{i}")))
 
-        data = []
+        cand = []
         for s, p in picks:
-            d = load_place(src, s, p)
-            mm = get_matches(d, cq, cf, int(ccap))
-            data.append((s, p, mm, get_annotations(mm["ckey"].tolist(), model) if len(mm) else {}))
-        table = pd.DataFrame([{"Jurisdiction": f"{p.title()}, {s.upper()}", **summarize(mm, an)} for s, p, mm, an in data])
-        table["Jurisdiction"] = table["Jurisdiction"] + table.groupby("Jurisdiction").cumcount().map(lambda i: f" ({i + 1})" if i else "")
+            mm, pr = gather(src, s, p, cq, cfg)
+            cand.append((s, p, mm))
+            for x in pr:
+                st.warning(f"{p}: open-us-law: {x}")
+        all_jobs = [make_job(mm, s, p, cq, mod, mcfg) for s, p, mm in cand if len(mm) for mod in models]
+        if all_jobs and st.button(f"Run everything ({len(cand)} places × {len(models)} model(s))", key="cmp_all"):
+            run_with_progress(all_jobs, mcfg["parallel"])
+            st.rerun()
+
+        cols_tbl = {}
+        for s, p, mm in cand:
+            for mod in models:
+                ex = C.markup_get(mm["ckey"].tolist(), "extract", mod) if len(mm) else {}
+                cols_tbl[f"{p.title()}, {s.upper()} · {mod}"] = C.summarize(mm, ex, mod) if len(mm) else {"Sections": 0}
         st.subheader("At a glance")
-        st.dataframe(table.set_index("Jurisdiction").T.astype(str))
+        st.dataframe(pd.DataFrame(cols_tbl).astype(str))
 
-        dim_cmp = st.selectbox("Compare distribution of", DIM_LIST, format_func=lambda d: DIMS[d], key="cmp_dim")
-        frames = [mm.assign(J=f"{p.title()}, {s.upper()}") for s, p, mm, _ in data if len(mm)]
-        if frames:
-            st.plotly_chart(px.strip(pd.concat(frames, ignore_index=True), x="J", y=dim_cmp, color="fn", hover_name="header"))
+        if len(models) == 2:
+            rows = []
+            for s, p, mm in cand:
+                if len(mm):
+                    ag = agreement(*(C.get_process(process_key(make_job(mm, s, p, cq, mod, mcfg))) for mod in models))
+                    if ag:
+                        rows.append({"place": f"{p.title()}, {s.upper()}", **{k: str(v) for k, v in ag.items()}})
+            if rows:
+                st.subheader("Do the two models agree?")
+                st.dataframe(pd.DataFrame(rows))
 
-        st.subheader("Provisions and process models")
-        for i, (col, (s, p, mm, an)) in enumerate(zip(grid_cols(n, per_row), data)):
-            with col:
-                st.markdown(f"### {p.title()}, {s.upper()}")
-                process_panel(mm, s, p, cq, f"cmp{i}_", model, host, color_dim, height=460)
+        st.subheader("Process models")
+        for pi, (s, p, mm) in enumerate(cand):
+            st.markdown(f"### {p.title()}, {s.upper()}")
+            if mm.empty:
+                st.info("No matching sections here.")
+                continue
+            for col, (mi, mod) in zip(grid_cols(len(models), 2), enumerate(models)):
+                with col:
+                    st.markdown(f"**{mod}**")
+                    cell(make_job(mm, s, p, cq, mod, mcfg), f"cmp{pi}_{mi}_", color_dim, height=460)
+
+    # ── Library ──
+    with t_lib:
+        st.subheader("Subject registry (controlled vocabulary)")
+        st.caption("Triage tags sections with these slugs. New ones arrive as *proposed*; approve them here. The QID links a subject "
+                   "to its Wikibase item and is what makes processes comparable across places.")
+        reg = C.subjects()
+        st.dataframe(pd.DataFrame([{"slug": k, **v} for k, v in reg.items()]))
+        c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+        sl = c1.selectbox("Subject", list(reg), key="lib_s")
+        qid = c2.text_input("Wikibase QID", reg[sl]["qid"], key="lib_q")
+        if c3.button("Save QID"):
+            C.subject_set(sl, qid=qid)
+            st.rerun()
+        if c4.button("Approve", disabled=reg[sl]["status"] != "proposed"):
+            C.subject_set(sl, status="approved")
+            st.rerun()
+        new = st.text_input("Add a subject (label)", key="lib_new")
+        if st.button("Add") and new:
+            C.subject_add(slug(new), new, "approved")
+            st.rerun()
+        st.subheader("Stored processes")
+        procs = C.list_processes()
+        st.dataframe(pd.DataFrame(procs))
+        if procs:
+            pk = st.selectbox("Process", [p["pkey"] for p in procs], key="lib_p")
+            st.download_button("Debug bundle (all stages, prompts, responses)", json.dumps(C.export_debug(pk), indent=2, default=str),
+                               f"{pk}-debug.json", "application/json")
 
 
 if __name__ == "__main__":
