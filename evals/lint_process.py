@@ -14,6 +14,7 @@ import argparse
 import collections
 import json
 import re
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -131,6 +132,11 @@ def lint(bpmn: str, sidecar: dict, bundle: dict | None, pass1: str | None, gold:
 
 
 def main() -> None:
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--bpmn", required=True)
     ap.add_argument("--sidecar", required=True)
@@ -138,10 +144,10 @@ def main() -> None:
     ap.add_argument("--pass1")
     ap.add_argument("--gold")
     a = ap.parse_args()
-    r = lint(a.bpmn, json.loads(Path(a.sidecar).read_text()),
-             json.loads(Path(a.bundle).read_text()) if a.bundle else None,
-             Path(a.pass1).read_text() if a.pass1 else None,
-             json.loads(Path(a.gold).read_text()) if a.gold else None)
+    r = lint(a.bpmn, json.loads(Path(a.sidecar).read_text(encoding="utf-8")),
+             json.loads(Path(a.bundle).read_text(encoding="utf-8")) if a.bundle else None,
+             Path(a.pass1).read_text(encoding="utf-8") if a.pass1 else None,
+             json.loads(Path(a.gold).read_text(encoding="utf-8")) if a.gold else None)
     print(json.dumps(r["metrics"], indent=2))
     order = {"high": 0, "med": 1, "low": 2, "info": 3}
     for f in sorted(r["findings"], key=lambda f: order[f["severity"]]):

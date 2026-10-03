@@ -6,7 +6,7 @@ verified, reviewable process models.
     ollama pull qwen2.5:7b        # or use the Models panel in the sidebar to pull from here
     streamlit run locus_explorer.py
 
-Env: HF_TOKEN (open-us-law is gated: accept its conditions on the Hub first), LOCUS_SRC, LOCUS_SLIM, LOCUS_DB,
+Hugging Face token: paste it in the sidebar (Hugging Face access); HF_TOKEN also works. Env: LOCUS_SRC, LOCUS_SLIM, LOCUS_DB,
      OLLAMA_HOST, OLLAMA_MODEL, OUL_TEMPLATE.
 Docs: README.md, docs/markup-schema.md, docs/wikibase-mapping.md
 """
@@ -27,6 +27,8 @@ import streamlit.components.v1 as components
 import locus_core as C
 from locus_bpmn import emit_bpmn
 from locus_core import DIM_LIST, DIMS, STATUSES, clean, default_host, default_model, label, sec_of, slug
+from locus_hf import (OUL_REPO, apply_to_duckdb, dataset_access, find_token, fingerprint, forget_saved_token, looks_like_token,
+                      mask, own_token_path, probe_duckdb, save_token, whoami)
 from locus_dmn import decision_xml
 from locus_llm import LLMUnavailable, model_available, model_selftest, pull_model, server_status, start_server
 from locus_markup import STAGES, Job, Progress, agreement, pipeline_status, process_key, run_jobs, run_pipeline
@@ -36,6 +38,7 @@ DEFAULT_SRC = os.environ.get("LOCUS_SRC", "hf://datasets/LocalLaws/LOCUS-v1/**/*
 TEMPLATE = os.environ.get("OUL_TEMPLATE", OUL_TEMPLATE)
 SLIM_PATH = Path(os.environ.get("LOCUS_SLIM", "locus_slim.parquet"))
 SCORES_ARE = "z-scores (standard units) from the paper's ModernBERT regressors"
+HOSTED = os.environ.get("LOCUS_HOSTED", "") == "1"      # never persist tokens on a shared server
 
 
 # ───────────────────────────── DuckDB plumbing ─────────────────────────────
@@ -49,18 +52,25 @@ def rel(path: str) -> str:
 
 @st.cache_resource
 def _con() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    try:
-        con.execute("INSTALL httpfs; LOAD httpfs;")
-    except Exception:  # noqa: BLE001
-        pass
-    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
-    if tok:
-        try:
-            con.execute(f"CREATE OR REPLACE SECRET hf_tok (TYPE HUGGINGFACE, TOKEN {lit(tok)})")
-        except Exception:  # noqa: BLE001
-            pass
-    return con
+    return duckdb.connect()
+
+
+@st.cache_resource
+def _hf_applied() -> dict:
+    return {"fp": None, "ok": True, "msg": ""}
+
+
+def ensure_hf() -> tuple[str, str, dict]:
+    """Make DuckDB use the current Hugging Face token (re-registers it only when it changes)."""
+    token, source = find_token(st.session_state.get("hf_token", ""))
+    fp, applied = fingerprint(token), _hf_applied()
+    if applied["fp"] != fp:
+        first = applied["fp"] is None
+        ok, msg = apply_to_duckdb(_con(), token)
+        applied.update(fp=fp, ok=ok, msg=msg)
+        if not first:
+            st.cache_data.clear()            # earlier 401/403 results must not stay cached
+    return token, source, applied
 
 
 def cur():
@@ -371,7 +381,66 @@ def grid_cols(n: int, per_row: int) -> list:
     return out
 
 
+def _use_token() -> None:
+    t = st.session_state.get("hf_token_input", "").strip()
+    if t:
+        st.session_state["hf_token"] = t
+        if st.session_state.get("hf_remember") and not HOSTED:
+            save_token(t)
+    st.session_state["hf_token_input"] = ""
+
+
+def _forget_token() -> None:
+    st.session_state["hf_token"] = ""
+    forget_saved_token()
+    st.cache_data.clear()
+
+
+def hf_panel(template: str) -> None:
+    token, source, applied = ensure_hf()
+    with st.expander("Hugging Face access", expanded=not token):
+        if token:
+            st.success(f"Using a token from **{source}** ({mask(token)})")
+        else:
+            st.warning("No token yet. open-us-law is gated, so state and federal law will not load without one.")
+        st.text_input("Paste your Hugging Face token", type="password", key="hf_token_input", placeholder="hf_…",
+                      help="Create a token with Read access at huggingface.co/settings/tokens. It stays in this session "
+                           "unless you tick 'Remember'.")
+        st.checkbox("Remember on this computer", key="hf_remember", disabled=HOSTED,
+                    help="Saves the token to " + str(own_token_path()) + (" (disabled on a shared server)" if HOSTED else ""))
+        c1, c2, c3 = st.columns(3)
+        c1.button("Use token", on_click=_use_token, key="hf_use")
+        check = c2.button("Check access", key="hf_check")
+        c3.button("Forget", on_click=_forget_token, key="hf_forget", help="Clears the session token and the one this app saved. "
+                  "A token set via an environment variable or `huggingface-cli login` is left alone.")
+        typed = st.session_state.get("hf_token_input", "")
+        if typed and not looks_like_token(typed):
+            st.caption("That does not look like a Hugging Face token (they start with `hf_`).")
+        l1, l2 = st.columns(2)
+        l1.link_button("Create a token", "https://huggingface.co/settings/tokens")
+        l2.link_button("Accept dataset terms", f"https://huggingface.co/datasets/{OUL_REPO}")
+        st.caption("No environment variable is needed. On Windows the app reads the token you paste here.")
+        if not applied["ok"]:
+            st.error(applied["msg"])
+        if check:
+            who = whoami(token)
+            st.markdown(("✅ " if who["ok"] else "❌ ") + (f"Signed in as **{who['name']}**" if who["ok"] else who["error"]))
+            acc = dataset_access(token)
+            st.markdown(("✅ " if acc["state"] == "ok" else "❌ ") + acc["message"])
+            pr = probe_duckdb(cur(), template)
+            st.markdown(("✅ " if pr["ok"] else "❌ ") + (f"DuckDB read `{pr['path'].rsplit('/', 1)[-1]}` ({pr['rows']:,} rows)"
+                                                       if pr["ok"] else f"DuckDB could not read `{pr['path']}`: {pr['error']}"))
+
+
+def law_hint(problem: str) -> str:
+    low = problem.lower()
+    if any(x in low for x in ("403", "401", "forbidden", "unauthorized", "gated", "authentication")):
+        return problem + "  → open **Hugging Face access** in the sidebar and use *Check access*."
+    return problem
+
+
 def sources_panel() -> dict:
+    ensure_hf()
     st.header("Data")
     src = st.text_input("LOCUS parquet (local ordinances)", DEFAULT_SRC, help="Local path, glob, or hf:// glob")
     agg_src = str(SLIM_PATH) if SLIM_PATH.exists() else src
@@ -384,15 +453,14 @@ def sources_panel() -> dict:
         st.rerun()
     sub_only = st.checkbox("National view: substantive chunks only", value=True)
     with st.expander("State / federal law (open-us-law)"):
-        has_tok = bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN"))
-        st.caption(("✅ HF_TOKEN is set. " if has_tok else "⚠ HF_TOKEN not set — the dataset is gated: accept its conditions on the "
-                    "Hub, then export HF_TOKEN. ") + "Files are named `us_{jurisdiction}_{corpus}.parquet`.")
+        st.caption("Files are named `us_{jurisdiction}_{corpus}.parquet`. Gated: see *Hugging Face access* below.")
         state_law = st.checkbox("Include state law for the selected state", True)
         federal_law = st.checkbox("Include federal law", False)
         template = st.text_input("File template", TEMPLATE)
         corpora = st.multiselect("Corpora", OUL_CORPORA, default=["statutes"])
         fed_code = st.text_input("Federal jurisdiction code in file names", "us", help="Check the dataset's Files tab: us, federal, …")
         pinned = st.text_input("Always include citations containing", "", help="Comma-separated, e.g. 58.1-3703")
+    hf_panel(template)
     c1, c2, c3 = st.columns(3)
     cap_local = int(c1.number_input("Local max", 1, 60, 15))
     cap_state = int(c2.number_input("State max", 0, 30, 6))
@@ -420,7 +488,7 @@ def main() -> None:
         states = list_states(agg_src)
     except Exception as e:  # noqa: BLE001
         st.error(f"Could not read `{agg_src}`.\n\n{e}")
-        st.info("Check the path/glob, set HF_TOKEN if the dataset is gated, or point LOCUS_SRC at a local parquet.")
+        st.info("Check the path/glob, paste a Hugging Face token in the sidebar (Hugging Face access) if the dataset is gated, or point LOCUS_SRC at a local parquet.")
         st.stop()
 
     t_nat, t_jur, t_prov, t_proc, t_cmp, t_lib = st.tabs(
@@ -515,7 +583,7 @@ def main() -> None:
         cfg["ctx"] = c2.checkbox("Include Context", False, key="pb_ctx")
         m, problems = gather(src, state, place, pq, cfg)
         for p in problems:
-            st.warning(f"open-us-law: {p}")
+            st.warning("open-us-law: " + law_hint(p))
         if m.empty:
             st.info("No matching sections. Try fewer or shorter words.")
         else:
@@ -558,7 +626,7 @@ def main() -> None:
             mm, pr = gather(src, s, p, cq, cfg)
             cand.append((s, p, mm))
             for x in pr:
-                st.warning(f"{p}: open-us-law: {x}")
+                st.warning(f"{p}: open-us-law: " + law_hint(x))
         all_jobs = [make_job(mm, s, p, cq, mod, mcfg) for s, p, mm in cand if len(mm) for mod in models]
         if all_jobs and st.button(f"Run everything ({len(cand)} places × {len(models)} model(s))", key="cmp_all"):
             run_with_progress(all_jobs, mcfg["parallel"])

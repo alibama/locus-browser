@@ -29,7 +29,7 @@ HERE = Path(__file__).parent
 
 
 def load_props(path: str | Path | None = None) -> dict:
-    return json.loads(Path(path or HERE / "properties.json").read_text())
+    return json.loads(Path(path or HERE / "properties.json").read_text(encoding="utf-8"))
 
 
 # ───────────────────────────── bundle ─────────────────────────────
@@ -315,6 +315,11 @@ def check_properties(props: dict, timeout: int = 15) -> list[str]:
 
 
 def main(argv=None) -> int:
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="compare properties.json with the live instance")
@@ -345,7 +350,7 @@ def main(argv=None) -> int:
     if rec is None:
         print("no such process", file=sys.stderr)
         return 1
-    qm = json.loads(Path(a.qid_map).read_text()) if a.qid_map else {}
+    qm = json.loads(Path(a.qid_map).read_text(encoding="utf-8")) if a.qid_map else {}
     try:
         bundle, p1, p2, report = export_files(rec, a.subject, qm, props, a.allow_draft, a.include_partial)
     except (PermissionError, ValueError) as e:
@@ -353,10 +358,10 @@ def main(argv=None) -> int:
         return 2
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "bundle.json").write_text(json.dumps(bundle, indent=2))
-    (out / "pass1.qs").write_text(p1)
-    (out / "pass2.qs").write_text(p2)
-    (out / "report.json").write_text(json.dumps(report, indent=2))
+    (out / "bundle.json").write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+    (out / "pass1.qs").write_text(p1, encoding="utf-8")
+    (out / "pass2.qs").write_text(p2, encoding="utf-8")
+    (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     for h in bundle["held_back"]:
         print(f"  [held back] {h}")
     print(f"{len(bundle['items'])} items · pass1 {p1.count(chr(10))} lines · pass2 {p2.count(chr(10))} lines")

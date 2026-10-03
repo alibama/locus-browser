@@ -245,3 +245,43 @@ def start(port: int = 0):
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+# ───────────────────────── fake Hugging Face (whoami + gated resolve) ─────────────────────────
+class HFH(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
+    seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body="", headers=None):
+        self.send_response(code)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def _handle(self):
+        auth = self.headers.get("Authorization", "")
+        HFH.seen.append((self.command, self.path, auth))
+        tok = auth.replace("Bearer ", "")
+        if self.path.startswith("/api/whoami-v2"):
+            return self._send(200, json.dumps({"name": "alice"})) if tok in ("hf_good_" + "x" * 20, "hf_nogate_" + "x" * 20) else self._send(401, "{}")
+        if "/resolve/main/" in self.path:
+            if not tok:
+                return self._send(401)
+            if tok == "hf_good_" + "x" * 20:
+                return self._send(302, "", {"Location": "http://127.0.0.1:1/cdn-signed-url"})   # must NOT be followed
+            if tok == "hf_nogate_" + "x" * 20:
+                return self._send(403)
+            return self._send(401)
+        self._send(404)
+
+    do_GET = do_HEAD = _handle
+
+
+def start_hf(port: int = 0):
+    srv = ThreadingHTTPServer(("127.0.0.1", port), HFH)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"

@@ -7,15 +7,33 @@ can feed [Lexipedia](https://lexipedia.xyz).
 
 ## Quick start
 
-```bash
-python -m venv .venv && source .venv/bin/activate
+**Windows (PowerShell)**
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-export HF_TOKEN=...            # open-us-law is gated: accept its conditions on the Hub first
-ollama pull qwen2.5:7b         # or pull from the app's Models panel
+ollama pull qwen2.5:7b          # or pull from the app's Models panel
 streamlit run locus_explorer.py
 ```
 
-Env: `HF_TOKEN`, `LOCUS_SRC`, `LOCUS_SLIM`, `LOCUS_DB`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OUL_TEMPLATE`.
+**macOS / Linux**
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+ollama pull qwen2.5:7b
+streamlit run locus_explorer.py
+```
+
+**Hugging Face token: no environment variable needed.** open-us-law is gated. In the app's sidebar open
+*Hugging Face access*, paste a token (Read access, from huggingface.co/settings/tokens), press **Use token**, then **Check access**.
+It checks three things and says which one fails: the token itself, whether you have accepted the dataset's terms, and whether
+DuckDB can actually read a file with it. Tick *Remember on this computer* to keep it in `~/.locus_explorer/hf_token`.
+(`export` is a bash command; on Windows use `$env:HF_TOKEN="hf_..."` in PowerShell, or `set HF_TOKEN=hf_...` in cmd, if you ever want
+the variable instead. A token from `huggingface-cli login` is also picked up.)
+
+Other env vars: `LOCUS_SRC`, `LOCUS_SLIM`, `LOCUS_DB`, `OLLAMA_HOST`, `OLLAMA_MODEL`, `OUL_TEMPLATE`, `HF_ENDPOINT`.
 The default LOCUS glob and open-us-law file template (`us_{jurisdiction}_{corpus}.parquet`) come from the dataset cards, not from
 a directory listing; both are editable in the sidebar.
 
@@ -56,6 +74,7 @@ locus_explorer.py    Streamlit UI
 locus_core.py        helpers + SQLite store (markup, relevance, regimes, processes, subjects, llm_log)
 locus_sources.py     LOCUS + open-us-law -> one provision shape
 locus_llm.py         Ollama client, status/start/pull/self-test, call logging
+locus_hf.py          Hugging Face token handling and access checks
 locus_markup.py      vocabularies, schemas, prompts, stages, parallel runner, model agreement
 locus_bpmn.py        BPMN 2.0 emitter (lanes by actor, verdict colouring)
 locus_dmn.py         rate tables -> DMN decision tables

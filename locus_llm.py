@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -47,7 +48,12 @@ def start_server(host: str, wait: float = 12.0) -> tuple[bool, str]:
     exe = shutil.which("ollama")
     if not exe:
         return False, "`ollama` not found on PATH. Install it from https://ollama.com, then retry."
-    subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    kw: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "stdin": subprocess.DEVNULL}
+    if sys.platform == "win32":      # start_new_session is POSIX-only; detach properly on Windows
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen([exe, "serve"], **kw)
     t0 = time.time()
     while time.time() - t0 < wait:
         if server_status(host, 1.0)["up"]:
